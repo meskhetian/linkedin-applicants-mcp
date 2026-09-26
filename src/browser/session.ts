@@ -179,6 +179,7 @@ export class BrowserSession {
 
   private async connect(): Promise<void> {
     const { cfg, log } = this.deps;
+    this.closing = false;
     if (cfg.browserMode === 'cdp') {
       log.info('connecting to Chrome over CDP', { cdpUrl: cfg.cdpUrl });
       let browser: Browser;
@@ -330,8 +331,9 @@ export class BrowserSession {
         await this.context?.close().catch(() => {});
       }
     } finally {
+      // The context's own 'close' event is dispatched after close() resolves; the flag stays set until the next
+      // launch so that event is never mistaken for a crash.
       this.reset();
-      this.closing = false;
     }
   }
 }

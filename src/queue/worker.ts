@@ -412,6 +412,12 @@ export class Worker {
       return;
     }
     const raw = errorMessage(e);
+    if (this.stopping) {
+      // The worker is shutting down (Ctrl-C, browser_close): the interrupted task goes back to the queue untouched.
+      db.requeueTask(task.id, undefined, 'interrupted by shutdown');
+      tlog.info('task interrupted by shutdown; requeued without counting an attempt');
+      return;
+    }
     // Only when Chrome itself is gone (crash, killed, closed by hand) does the retry policy skip the resume; a closed
     // tab produces the same Playwright text but leaves the session connected.
     const msg = !this.deps.session.isConnected() && BROWSER_LOST_RE.test(raw) ? `Browser lost: ${raw}` : raw;

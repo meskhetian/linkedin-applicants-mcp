@@ -35,6 +35,28 @@ function makeDeps(runners: Partial<Record<TaskType, TaskRunner>>) {
 }
 
 describe('Worker.runOnce', () => {
+  it('requeues a task interrupted by a shutdown without counting an attempt', async () => {
+    let stopper: (() => Promise<void>) | undefined;
+    const { deps, db } = makeDeps({
+      fetch_profile: async () => {
+        await stopper!(); // the worker is asked to stop while this task runs
+        throw new Error('aborted');
+      },
+    });
+    const id = db.enqueueTask({ type: 'fetch_profile', jobId: 'j', applicationId: 'a', profileUrl: 'u', depth: 'basic', savePdf: false })!;
+    const w = new Worker(deps);
+    stopper = async () => {
+      w.start();
+      await w.stop();
+    };
+    expect(await w.runOnce()).toBe(true);
+    const t = db.db.prepare('SELECT status, attempts, last_error FROM tasks WHERE id = ?').get(id) as { status: string; attempts: number; last_error: string };
+    expect(t.status).toBe('pending');
+    expect(t.attempts).toBe(0);
+    expect(t.last_error).toBe('interrupted by shutdown');
+    expect(db.taskCounts().failed).toBe(0);
+  });
+
   it('leaves a task cancelled when its runner stops on a cancellation', async () => {
     const { deps, db } = makeDeps({
       sync_applicants: async (task, _ctx, d) => {

@@ -32,6 +32,9 @@ changes; they are called out explicitly.
   and only idles when nothing at all can run.
 - The passive capture never waits on streaming responses (LinkedIn keeps a realtime event stream open) and bounds
   every body read, so an application fetch cannot stall on the resume step.
+- Stopping the worker (Ctrl-C, `browser_close`) while a task runs no longer counts as a failed attempt for that task:
+  it goes back to the queue untouched. The "Chrome went away unexpectedly" warning no longer fires for the session's
+  own shutdown.
 - The session logs when Chrome goes away unexpectedly, and a task whose page vanished during the resume step fails
   instead of finishing without a resume, so the retry policy can react.
 - Log lines carry host and path of resume URLs only; signed tokens stay in the raw capture next to the file.
