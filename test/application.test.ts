@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, redactUrl, scoreDocumentUrl, shouldReadResponseBody, sliceBetween, sniffExt } from '../src/linkedin/application.js';
+import { decideResumeIntercept, extractFitLabel, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, redactUrl, scoreDocumentUrl, shouldReadResponseBody, sliceBetween, sniffExt } from '../src/linkedin/application.js';
 
 describe('filenameFromContentDisposition', () => {
   it('handles plain, quoted and RFC 5987 forms', () => {
@@ -152,5 +152,14 @@ describe('shouldReadResponseBody', () => {
     expect(shouldReadResponseBody({ resourceType: 'document', contentType: 'application/pdf', url: 'https://media.licdn.com/dms/document/x.pdf' })).toBe('skip');
     expect(shouldReadResponseBody({ resourceType: 'image', contentType: 'image/png', url: 'https://media.licdn.com/dms/image/v2/x/profile-displayphoto-shrink_100_100/y' })).toBe('skip');
     expect(shouldReadResponseBody({ resourceType: 'script', contentType: 'application/javascript', url: 'https://static.licdn.com/sc/h/app.js' })).toBe('skip');
+  });
+});
+
+describe('extractFitLabel', () => {
+  it('reads LinkedIn\'s match label under the Qualifications heading', () => {
+    expect(extractFitLabel('Qualifications\nNot a fit\n5/6\nMust-have\n5/5\nPreferred')).toBe('Not a fit');
+    expect(extractFitLabel('Qualifications\nTop fit\n6/6\nMust-have')).toBe('Top fit');
+    expect(extractFitLabel('Qualifications\n6/6\nMust-have')).toBeUndefined();
+    expect(extractFitLabel(undefined)).toBeUndefined();
   });
 });

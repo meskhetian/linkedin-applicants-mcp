@@ -40,6 +40,11 @@ changes; they are called out explicitly.
 
 - LinkedIn "Save to PDF" for profiles is skipped with a warning while Chrome downloads are denied (the option is
   reserved); the structured profile is stored as before.
+- Contact details were captured for 3 of 21 applications although the Contact button was present in 20 of them:
+  the SDUI button's text content carries hidden helper text, so the exact-text selector missed it. The button is
+  now found by its stable data-view-name (with a contains-text fallback that excludes "Contacted"), the popover's
+  email link and phone block are read directly, and LinkedIn's own match label ("Top fit", "Not a fit") is stored
+  with the application.
 - Hiring Pro application details: the detail pane is now isolated as the whole block from the applicant header
   down to "View full profile" instead of the header card alone, so the Contact button, the Qualifications section
   and the experience summary are read. Contact popovers without ARIA roles are captured by diffing the page text,

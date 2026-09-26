@@ -186,6 +186,13 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
         contactDiag.clicked = true;
         await human.pause('short');
         for (const it of await allOfFirst(page, SEL[gen].detail.contactItems)) contactText += `${(await textOf(it)) ?? ''}\n`;
+        // Hiring Pro popover: explicit fields (an email link and a phone block) next to "Message" and "Mark as contacted".
+        const emailLink = await firstPresent(page, ['[data-view-name="hiring-applicant-contact-email"]', '[data-view-name*="contact-email" i]']);
+        const emailHref = await attrOf(emailLink, 'href');
+        if (emailHref?.startsWith('mailto:')) email ??= emailHref.slice(7).split('?')[0];
+        else email ??= extractEmail((await textOf(emailLink)) ?? undefined);
+        const phoneBlock = await firstPresent(page, ['[data-view-name="hiring-applicant-contact-phone"]', '[data-view-name*="contact-phone" i]']);
+        phone ??= extractPhone((await textOf(phoneBlock)) ?? undefined);
         // Popovers without ARIA roles: whatever text appeared after the click is the contact card.
         const bodyAfter = await page.evaluate(() => document.body.innerText).catch(() => '');
         const seen = new Set(bodyBefore.split('\n').map((l) => l.trim()));
@@ -218,6 +225,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
 
   // Qualifications (Hiring Pro): must-have / preferred statements and the applicant's match
   const qualificationsText = extractQualificationsText(text);
+  const fitLabel = extractFitLabel(qualificationsText);
 
   // Screening questions
   const screeningSection = await firstVisible(root, SEL[gen].detail.screeningSection, { timeoutMs: 800 });
@@ -268,7 +276,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     hasResume: resume.hasResume,
     resumePath: resume.path,
     resumeFileName: resume.fileName,
-    extra: { rawTextChars: text.length, resumeStrategy: resume.strategy, resumeHost: resume.host, generation: gen, uiVariant: variant, appliedAgo, qualificationsText, resumeDebug: resume.debug, contact: contactDiag },
+    extra: { rawTextChars: text.length, resumeStrategy: resume.strategy, resumeHost: resume.host, generation: gen, uiVariant: variant, appliedAgo, qualificationsText, fitLabel, resumeDebug: resume.debug, contact: contactDiag },
     raw: { headerText: text.slice(0, 1500) },
   };
 }
@@ -318,6 +326,15 @@ export function sliceBetween(text: string, start: RegExp, end: RegExp, maxChars 
     .join('\n')
     .trim();
   return out ? out.slice(0, maxChars) : undefined;
+}
+
+/** LinkedIn's own match label at the top of the Qualifications section ("Top fit", "Good fit", "Not a fit"). */
+export function extractFitLabel(qualificationsText: string | undefined): string | undefined {
+  if (!qualificationsText) return undefined;
+  const lines = qualificationsText.split('\n').map((l) => l.trim());
+  const i = lines.findIndex((l) => /^qualifications$/i.test(l));
+  const next = lines[i + 1];
+  return next && /^(top fit|good fit|strong fit|not a fit|maybe|likely match|possible match)$/i.test(next) ? next : undefined;
 }
 
 /** Hiring Pro shows the job's must-have / preferred qualifications and how the applicant scores against them. */
