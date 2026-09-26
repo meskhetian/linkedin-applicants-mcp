@@ -1092,7 +1092,6 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
     const now = new Date().toISOString();
     const missing = rows.filter((r) => db.applicantIdsByName(jobId, r.fullName).length === 0);
     log.info('table sweep page read', { jobId, offset, rows: rows.length, missing: missing.length });
-    opts.onPage?.([], st.pagesThisRun - 1, offset + TABLE_PAGE_SIZE);
     let lastId: string | undefined;
     for (const [i, row] of missing.entries()) {
       // A row click opens a detail drawer in the same page (the URL does not change). The drawer shows the profile
@@ -1150,6 +1149,8 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
     }
     const done = rows.length < TABLE_PAGE_SIZE || (totalReported !== undefined && offset + TABLE_PAGE_SIZE >= totalReported);
     offset += TABLE_PAGE_SIZE;
+    // Only now is this page finished (all its unknown rows handled): a retry may resume from the next one.
+    opts.onPage?.([], st.pagesThisRun - 1, offset);
     if (done) {
       persist(true);
       log.info('table sweep complete', { jobId, recoveredThisRun: recovered, stored: db.countApplicants(jobId), totalReported });

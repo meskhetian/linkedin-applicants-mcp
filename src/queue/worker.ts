@@ -18,6 +18,9 @@ import { BrowserNotConnectedError, CheckpointError, DeferredError, NotLoggedInEr
 
 const TASK_TYPES: TaskType[] = ['sync_jobs', 'sync_applicants', 'fetch_application', 'fetch_profile'];
 
+/** Chromium network errors that mean the machine is offline rather than LinkedIn misbehaving. */
+export const OFFLINE_RE = /net::ERR_(INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|NETWORK_CHANGED|ADDRESS_UNREACHABLE|CONNECTION_(RESET|REFUSED|CLOSED|TIMED_OUT|ABORTED)|TIMED_OUT|PROXY_CONNECTION_FAILED)/i;
+
 /** Executes one task type against a live ScrapeContext. 'requeued' means the runner already re-scheduled the task. */
 export type TaskRunner = (task: Task, ctx: ScrapeContext, deps: WorkerDeps) => Promise<'done' | 'requeued'>;
 
@@ -78,8 +81,10 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
         includeNotAFit: p.includeNotAFit,
         sort: p.sort,
         sweep: p.sweep,
-        // queue_cancel while a list is being paged: stop after the current page instead of finishing the chunk.
-        onPage: () => {
+        // After every page: remember where to resume (a failure mid-chunk restarts from this page, not from the
+        // chunk's first page), and stop here if queue_cancel arrived meanwhile.
+        onPage: (_applicants, _pageIndex, nextOffset) => {
+          deps.db.updateTaskPayload(task.id, { ...p, startOffset: nextOffset });
           if (deps.db.taskStatus(task.id) === 'cancelled') throw new TaskCancelledError(task.id);
         },
       });
@@ -452,6 +457,16 @@ export class Worker {
       return;
     }
 
+    if (OFFLINE_RE.test(raw)) {
+      // The machine lost its connection (Wi-Fi drop, DNS): nothing LinkedIn did. Try again in a few minutes without
+      // counting an attempt or a consecutive failure.
+      const resumeAt = new Date(Date.now() + 5 * 60_000);
+      db.requeueTask(task.id, resumeAt.toISOString(), `offline: ${raw.split('\n')[0]}`);
+      db.addEvent('warn', 'offline', 'No internet connection; the task is requeued and the worker waits a few minutes', { taskId: task.id, resumeAt: resumeAt.toISOString() });
+      tlog.warn('no internet connection; requeued and waiting', { resumeAt: resumeAt.toISOString() });
+      await this.idle(5 * 60_000);
+      return;
+    }
     this.consecutiveFailures++;
     const status = db.markTaskFailed(task.id, msg, { retry: isRetryable(e), backoffMs: 5 * 60_000 * Math.max(1, task.attempts + 1) });
     db.addEvent('error', 'task-failed', msg, { taskId: task.id, type: task.type, status });

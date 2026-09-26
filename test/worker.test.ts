@@ -7,7 +7,7 @@ import { CheckpointError, RateLimitedError, TaskCancelledError } from '../src/er
 import type { ScrapeContext } from '../src/linkedin/context.js';
 import { silentLogger } from '../src/log.js';
 import { Scheduler } from '../src/queue/scheduler.js';
-import { SETTINGS, Worker, type TaskRunner, type WorkerDeps } from '../src/queue/worker.js';
+import { OFFLINE_RE, SETTINGS, Worker, type TaskRunner, type WorkerDeps } from '../src/queue/worker.js';
 import { Db } from '../src/storage/db.js';
 import type { PacingSettings, TaskType } from '../src/types.js';
 
@@ -35,6 +35,25 @@ function makeDeps(runners: Partial<Record<TaskType, TaskRunner>>) {
 }
 
 describe('Worker.runOnce', () => {
+  it('treats a lost internet connection as a pause, not as a task failure', async () => {
+    const { deps, db } = makeDeps({
+      fetch_profile: async () => {
+        throw new Error('page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.linkedin.com/in/x/');
+      },
+    });
+    const id = db.enqueueTask({ type: 'fetch_profile', jobId: 'j', applicationId: 'a', profileUrl: 'u', depth: 'basic', savePdf: false })!;
+    const w = new Worker(deps);
+    expect(await w.runOnce()).toBe(true);
+    const t = db.db.prepare('SELECT status, attempts, run_after, last_error FROM tasks WHERE id = ?').get(id) as { status: string; attempts: number; run_after: string; last_error: string };
+    expect(t.status).toBe('pending');
+    expect(t.attempts).toBe(0);
+    expect(t.run_after).toBeTruthy();
+    expect(t.last_error.startsWith('offline:')).toBe(true);
+    expect(db.taskCounts().failed).toBe(0);
+    expect(OFFLINE_RE.test('Error: page.goto: net::ERR_NAME_NOT_RESOLVED at https://www.linkedin.com/')).toBe(true);
+    expect(OFFLINE_RE.test('Error: locator.click: Timeout 30000ms exceeded')).toBe(false);
+  });
+
   it('requeues a task interrupted by a shutdown without counting an attempt', async () => {
     let stopper: (() => Promise<void>) | undefined;
     const { deps, db } = makeDeps({

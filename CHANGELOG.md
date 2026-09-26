@@ -32,6 +32,10 @@ changes; they are called out explicitly.
   and only idles when nothing at all can run.
 - The passive capture never waits on streaming responses (LinkedIn keeps a realtime event stream open) and bounds
   every body read, so an application fetch cannot stall on the resume step.
+- A lost internet connection (DNS or network errors from Chrome) no longer counts as task failures or triggers the
+  "LinkedIn markup may have changed" cool-down: the task is requeued and the worker waits a few minutes.
+- List syncs and sweeps remember their offset after every page, so a failure in the middle of a chunk resumes from
+  that page instead of the chunk's first page.
 - Stopping the worker (Ctrl-C, `browser_close`) while a task runs no longer counts as a failed attempt for that task:
   it goes back to the queue untouched. The "Chrome went away unexpectedly" warning no longer fires for the session's
   own shutdown.
