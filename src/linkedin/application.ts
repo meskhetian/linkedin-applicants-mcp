@@ -656,6 +656,12 @@ class ResumeTrap {
   }
 }
 
+/** Anchors with a download attribute skip request interception and go straight to the download manager. */
+async function isDownloadAnchor(loc: Locator): Promise<boolean> {
+  const v = await loc.getAttribute('download', { timeout: 500 }).catch(() => null);
+  return v !== null;
+}
+
 /** The Chrome process or the working tab is gone: let the task fail so the retry policy can react. */
 function assertPageAlive(page: Page): void {
   if (page.isClosed()) throw new Error('Target page, context or browser has been closed during the resume step');
@@ -705,8 +711,16 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
         const saved = await fetchResume(ctx, absolutize(href, page.url()), saveDir);
         if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
       }
-      const got = await clickAndTrap(ctx, dlLink, trap, saveDir, 8000);
-      if (got) return { ...got, hasResume: true };
+      if (await isDownloadAnchor(dlLink)) {
+        // An anchor with a download attribute bypasses request interception and goes straight to the download
+        // manager: fetch its target ourselves instead of clicking.
+        const saved = href ? await fetchResume(ctx, absolutize(href, page.url()), saveDir) : undefined;
+        if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
+        log.debug('download-attribute link skipped (never clicked)', { href: href ? redactUrl(href) : undefined });
+      } else {
+        const got = await clickAndTrap(ctx, dlLink, trap, saveDir, 8000);
+        if (got) return { ...got, hasResume: true };
+      }
     } else {
       const more = await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 500 });
       if (more) {
@@ -732,6 +746,12 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
     if (btnHref && looksLikeResumeUrl(btnHref)) {
       const saved = await fetchResume(ctx, absolutize(btnHref, page.url()), saveDir);
       if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
+    }
+    if (await isDownloadAnchor(btn)) {
+      const saved = btnHref ? await fetchResume(ctx, absolutize(btnHref, page.url()), saveDir) : undefined;
+      if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
+      log.warn('resume control is a download-attribute link whose target could not be fetched; not clicking it', { href: btnHref ? redactUrl(btnHref) : undefined });
+      return { strategy: 'none', hasResume: true };
     }
     const direct = await clickAndTrap(ctx, btn, trap, saveDir, 8000);
     if (direct) {
@@ -773,7 +793,14 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
 
     // (d) Download control inside the viewer
     const dlBtn = await firstVisible(page, SEL[gen].detail.downloadButton, { timeoutMs: 2000 });
-    if (dlBtn) {
+    if (dlBtn && (await isDownloadAnchor(dlBtn))) {
+      const href = await attrOf(dlBtn, 'href');
+      const saved = href ? await fetchResume(ctx, absolutize(href, page.url()), saveDir) : undefined;
+      if (saved) {
+        await closeViewer();
+        return { ...saved, strategy: 'attachment', hasResume: true };
+      }
+    } else if (dlBtn) {
       const got = await clickAndTrap(ctx, dlBtn, trap, saveDir, 12_000, true);
       if (got) {
         await closeViewer();

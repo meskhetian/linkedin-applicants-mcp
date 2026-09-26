@@ -20,6 +20,14 @@ changes; they are called out explicitly.
   download is cancelled, and if Chrome is still lost during an application fetch the
   retry captures the details without the resume and records why. `applicants_fetch_details` with its defaults now
   also targets applicants whose resume is still missing.
+- The crash is a known Chromium 152 to 154 issue (microsoft/playwright#42506, MicrosoftEdge/DevTools#461): once a
+  profile holds download history, any download start over the DevTools pipe crashes the browser process, and a
+  denied download still creates the download item. Before every launch the session now clears the `downloads`
+  tables of the profile's History database (nothing else is touched), so the trigger is gone even if a download
+  slips through. Links that carry a `download` attribute bypass request interception, so they are fetched, never
+  clicked.
+- Launch refuses to start when another live process holds the profile's SingletonLock, with a message naming the
+  pid, instead of two Chromes closing each other.
 - The session logs when Chrome goes away unexpectedly, and a task whose page vanished during the resume step fails
   instead of finishing without a resume, so the retry policy can react.
 - Log lines carry host and path of resume URLs only; signed tokens stay in the raw capture next to the file.

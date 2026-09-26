@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { chromium, type Browser, type BrowserContext, type Page } from 'patchright';
 import type { Config } from '../config.js';
 import type { BrowserStatus, CheckpointInfo, Logger, PacingSettings } from '../types.js';
@@ -36,6 +37,59 @@ export function decideLoggedIn(input: { url: string; hasLiAt: boolean; navVisibl
  * Idempotent: only rewrites the file when something changed. Applies to persistent mode; in cdp mode the profile
  * belongs to the Chrome the user launched (scripts/launch-chrome.sh points it at the same directory).
  */
+/**
+ * Chromium 152 to 154 crash their browser process when a download starts over the DevTools pipe in a profile that
+ * already holds persisted download history (microsoft/playwright#42506, MicrosoftEdge/DevTools#461). A denied
+ * download still creates the download item, so the only safe profile is one without download rows. Run while
+ * Chrome is not running. Returns the number of rows removed, or undefined when the History database was not
+ * available (locked by a running Chrome, or not created yet).
+ */
+export function clearDownloadHistory(profileDir: string, log?: Logger): number | undefined {
+  const historyFile = path.join(profileDir, 'Default', 'History');
+  if (!fs.existsSync(historyFile)) return undefined;
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(historyFile);
+    db.exec('PRAGMA busy_timeout = 1500');
+    const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('downloads', 'downloads_url_chains', 'downloads_slices')").all() as Array<{ name: string }>).map((r) => r.name));
+    let removed = 0;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const t of ['downloads_slices', 'downloads_url_chains', 'downloads']) if (tables.has(t)) removed += Number(db.prepare(`DELETE FROM ${t}`).run().changes);
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+    if (removed) log?.info('cleared Chrome download history from the profile (Chromium 152-154 download crash workaround)', { rows: removed });
+    return removed;
+  } catch (e) {
+    log?.warn('could not clear Chrome download history (is Chrome still running on this profile?)', { error: errorMessage(e) });
+    return undefined;
+  } finally {
+    db?.close();
+  }
+}
+
+/** "MacBook-Pro.local-50715" → 50715: the pid Chrome wrote into the SingletonLock symlink target. */
+export function parseSingletonLockPid(target: string): number | undefined {
+  const m = /-(\d+)$/.exec(target.trim());
+  const pid = m ? Number(m[1]) : NaN;
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** The live process that holds this profile's SingletonLock, if any (a stale lock from a crash is ignored). */
+export function profileLockHolder(profileDir: string): number | undefined {
+  try {
+    const pid = parseSingletonLockPid(fs.readlinkSync(path.join(profileDir, 'SingletonLock')));
+    if (!pid || pid === process.pid) return undefined;
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return undefined;
+  }
+}
+
 export function ensureChromePreferences(profileDir: string, downloadsPath: string, log?: Logger): void {
   try {
     const defDir = path.join(profileDir, 'Default');
@@ -151,9 +205,17 @@ export class BrowserSession {
     }
 
     fs.mkdirSync(cfg.profileDir, { recursive: true });
+    // Two Chromes on one profile close each other (and Chrome kills an unresponsive holder after 20 s): refuse.
+    const holder = profileLockHolder(cfg.profileDir);
+    if (holder) {
+      throw new BrowserNotConnectedError(
+        `Chrome (pid ${holder}) is already running on profile ${cfg.profileDir}. Another worker or debug session owns it; stop that process first (Ctrl-C on "npm run worker", or browser_close in the client that runs the queue).`,
+      );
+    }
     const downloadsPath = path.join(cfg.dataDir, 'downloads');
     fs.mkdirSync(downloadsPath, { recursive: true });
     ensureChromePreferences(cfg.profileDir, downloadsPath, log);
+    clearDownloadHistory(cfg.profileDir, log);
     log.info('launching Chrome with persistent profile', { channel: cfg.chromeChannel, profileDir: cfg.profileDir });
     try {
       this.context = await chromium.launchPersistentContext(cfg.profileDir, {
