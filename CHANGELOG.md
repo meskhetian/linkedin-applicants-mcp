@@ -40,6 +40,10 @@ changes; they are called out explicitly.
 
 - LinkedIn "Save to PDF" for profiles is skipped with a warning while Chrome downloads are denied (the option is
   reserved); the structured profile is stored as before.
+- Applicant lists ended about 4 to 5 percent short of LinkedIn's count and still read "list complete": LinkedIn's
+  date order shifts between page loads, so duplicates on one page displace applicants that never render. A complete
+  list that is more than 2 percent short now gets a sweep in another order (last name, then qualification match),
+  the list order is a task option (`sort`), and the dashboard shows the remaining gap instead of a bare "complete".
 - A Hiring Pro applicant list declared itself complete after a page rendered no cards while the reported total
   said thousands remained (a slow render or a click that landed mid-load). The crawler now waits and reads the
   page again, leaves the list incomplete at that page so the next run retries it with a fresh navigation, and

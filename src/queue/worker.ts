@@ -6,7 +6,7 @@ import type { ScheduleDecision, Scheduler } from './scheduler.js';
 import type { Logger, PacingSettings, Task, TaskPayload, TaskType, WorkerStatus } from '../types.js';
 import { createScrapeContext, type ScrapeContext } from '../linkedin/context.js';
 import { syncPostedJobs } from '../linkedin/jobs.js';
-import { syncApplicantList } from '../linkedin/applicants.js';
+import { nextSweepSort, syncApplicantList } from '../linkedin/applicants.js';
 import { fetchApplicationDetail } from '../linkedin/application.js';
 import { BROWSER_LOST_RE, shouldSkipResumeDownload } from './resume-policy.js';
 import { fetchProfile, profileToText } from '../linkedin/profile.js';
@@ -76,6 +76,8 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
         startOffset: p.startOffset,
         maxPages: p.pagesPerRun ?? 12,
         includeNotAFit: p.includeNotAFit,
+        sort: p.sort,
+        sweep: p.sweep,
         // queue_cancel while a list is being paged: stop after the current page instead of finishing the chunk.
         onPage: () => {
           if (deps.db.taskStatus(task.id) === 'cancelled') throw new TaskCancelledError(task.id);
@@ -86,6 +88,13 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
         deps.db.updateTaskPayload(task.id, { ...p, startOffset: r.nextOffset });
         deps.db.requeueTask(task.id);
         return 'requeued';
+      }
+      const progress = deps.db.getSyncProgress(p.jobId);
+      const sweepSort = nextSweepSort(progress, !!p.sweep);
+      if (sweepSort && progress) {
+        deps.db.enqueueTask({ type: 'sync_applicants', jobId: p.jobId, pagesPerRun: p.pagesPerRun, includeNotAFit: p.includeNotAFit, sort: sweepSort, sweep: true, startOffset: 0 }, { priority: task.priority });
+        deps.db.addEvent('info', 'list-sweep', `List of job ${p.jobId} ended at ${progress.stored} of ${progress.totalReported}; a second pass in ${sweepSort} order is queued to pick up applicants LinkedIn's paging skipped.`, { jobId: p.jobId, sort: sweepSort });
+        deps.log.info('list ended short of the reported total; sweep queued', { jobId: p.jobId, stored: progress.stored, totalReported: progress.totalReported, sort: sweepSort });
       }
       return 'done';
     },

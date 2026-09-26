@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideNextPage, fitPriorityBonus, parseApplicantCardText, parseAppliedOn, parseFitScore, parseNameBadges, parseProRowText } from '../src/linkedin/applicants.js';
+import { decideNextPage, fitPriorityBonus, nextSweepSort, parseApplicantCardText, parseAppliedOn, parseFitScore, parseNameBadges, parseProRowText } from '../src/linkedin/applicants.js';
 
 describe('parseApplicantCardText (legacy)', () => {
   it('parses a legacy-style card', () => {
@@ -164,5 +164,21 @@ describe('fit score from the list counters', () => {
     expect(b('3/6 · Must-have · 0/5 · Preferred')).toBe(5);
     expect(b('1/6 · Must-have · 5/5 · Preferred')).toBe(4);
     expect(b(undefined)).toBe(0);
+  });
+});
+
+describe('nextSweepSort', () => {
+  const base = { jobId: 'j', nextOffset: 1000, pagesVisited: 41, totalReported: 1005, stored: 955, complete: true, stoppedEarly: true } as const;
+  it('queues a sweep in another order when a complete list is more than 2% short', () => {
+    expect(nextSweepSort({ ...base }, false)).toBe('LastName');
+    expect(nextSweepSort({ ...base, sweeps: 1 }, true)).toBe('QualificationMatch');
+    expect(nextSweepSort({ ...base, sweeps: 2 }, true)).toBeUndefined();
+  });
+  it('does not sweep lists that are close enough, incomplete, or without a total', () => {
+    expect(nextSweepSort({ ...base, stored: 990 }, false)).toBeUndefined();
+    expect(nextSweepSort({ ...base, complete: false }, false)).toBeUndefined();
+    expect(nextSweepSort({ ...base, totalReported: undefined }, false)).toBeUndefined();
+    // A sweep that did not register as a sweep must not queue itself again.
+    expect(nextSweepSort({ ...base, sweeps: 0 }, true)).toBeUndefined();
   });
 });

@@ -198,6 +198,8 @@ export interface Profile {
 
 // ---------- Queue ----------
 
+export type ApplicantListSort = 'DateApplied' | 'QualificationMatch' | 'FirstName' | 'LastName';
+
 export type TaskType = 'sync_jobs' | 'sync_applicants' | 'fetch_application' | 'fetch_profile';
 
 export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -213,6 +215,10 @@ export type TaskPayload =
       startOffset?: number;
       /** Include applicants LinkedIn hides by default under the Ratings filter ("Not a fit"). Default true. */
       includeNotAFit?: boolean;
+      /** List order. LinkedIn's date order shifts between page loads and drops a few percent of applicants; a sweep uses another order. */
+      sort?: ApplicantListSort;
+      /** Second pass over an already complete list with a different order, to pick up applicants the first pass never saw. */
+      sweep?: boolean;
       /** Stop after this many pages in total (undefined = whole list). */
       maxPages?: number;
     }
@@ -279,6 +285,8 @@ export interface ApplicantSyncProgress {
   stoppedEarly?: boolean;
   /** Hiring Pro: consecutive runs that ended on a page rendering no cards (the list gives up after three) */
   blankRuns?: number;
+  /** Sweeps (second passes with a different order) completed for this list */
+  sweeps?: number;
   /** Which list mechanics were detected: offset URL, numbered page buttons, or infinite scroll */
   paginationMode?: 'offset' | 'buttons' | 'scroll';
   /** Which dashboard UI this job renders: legacy Ember list (offset pages, r= rating buckets) or the 2026 "Hiring Pro" list (infinite scroll, rating=ALL) */

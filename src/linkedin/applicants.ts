@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { Locator, Page } from 'patchright';
-import type { Applicant, ApplicantRating, ApplicantSyncProgress } from '../types.js';
+import type { Applicant, ApplicantListSort, ApplicantRating, ApplicantSyncProgress } from '../types.js';
 import type { ScrapeContext } from './context.js';
 import type { Generation } from './selectors.js';
 import { SEL } from './selectors.js';
@@ -16,6 +16,10 @@ export interface SyncApplicantsOptions {
   startOffset?: number;
   /** Include hidden "Not a fit" applicants (legacy: crawl the NOT_A_FIT bucket too). Default true. */
   includeNotAFit?: boolean;
+  /** Hiring Pro list order (default DateApplied). */
+  sort?: ApplicantListSort;
+  /** Second pass over a complete list with another order; starts at `startOffset` (default 0) and keeps the list marked complete. */
+  sweep?: boolean;
   /** Called after each page is parsed and persisted. */
   onPage?: (applicants: Applicant[], pageIndex: number, nextOffset: number) => void;
 }
@@ -722,6 +726,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
   const { jobId, progress } = st;
   let totalReported = progress?.totalReported;
   let stoppedEarly = false;
+  const sweep = !!opts.sweep;
   const persist = (nextPage: number, done: boolean, blankRuns = 0) => {
     db.setSyncProgress({
       jobId,
@@ -732,6 +737,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
       complete: done,
       stoppedEarly: stoppedEarly || undefined,
       blankRuns: blankRuns || undefined,
+      sweeps: (progress?.sweeps ?? 0) + (sweep && done ? 1 : 0) || undefined,
       paginationMode: 'buttons',
       uiVariant: 'hiring_pro',
       rowsLoaded: st.seen.size,
@@ -750,12 +756,14 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
     stoppedEarly: stoppedEarly || undefined,
   });
 
-  const resumeOffset = opts.startOffset ?? progress?.nextOffset ?? 0;
+  // A sweep re-reads a complete list in another order from the top (its own chunks pass startOffset explicitly).
+  const resumeOffset = opts.startOffset ?? (sweep ? 0 : (progress?.nextOffset ?? 0));
   const startPage = Math.max(1, Math.floor(resumeOffset / APPLICANTS_PAGE_SIZE) + 1);
   const mark = ctx.capture.mark();
+  const sort: ApplicantListSort = opts.sort ?? 'DateApplied';
   // LinkedIn puts the page offset in the URL (…&start=225), so resume by navigating straight to it and
   // verify with the page indicator; fall back to clicking through if the parameter was ignored.
-  await human.goto(page, URLS.applicantsPro(jobId, 'DateApplied', startPage > 1 ? (startPage - 1) * APPLICANTS_PAGE_SIZE : 0));
+  await human.goto(page, URLS.applicantsPro(jobId, sort, startPage > 1 ? (startPage - 1) * APPLICANTS_PAGE_SIZE : 0));
   await ctx.assertHealthy();
   await human.pause('read');
   const gen = await ctx.generation();
@@ -866,4 +874,19 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
   }
   persist(current, true);
   return result(true, current);
+}
+
+/**
+ * LinkedIn's date order shifts between page loads, so a first pass typically ends a few percent short of the
+ * reported total (duplicates on one page displace applicants that never render). One or two sweeps in another
+ * order recover most of them. Returns the order for the next sweep, or undefined when none is due.
+ */
+export function nextSweepSort(progress: ApplicantSyncProgress | undefined, currentTaskIsSweep: boolean): ApplicantListSort | undefined {
+  if (!progress?.complete || !progress.totalReported) return undefined;
+  if (progress.stored >= progress.totalReported * 0.98) return undefined;
+  const sweeps = progress.sweeps ?? 0;
+  const order: ApplicantListSort[] = ['LastName', 'QualificationMatch'];
+  if (sweeps >= order.length) return undefined;
+  if (currentTaskIsSweep && sweeps === 0) return undefined; // the sweep itself did not register: do not loop
+  return order[sweeps];
 }
