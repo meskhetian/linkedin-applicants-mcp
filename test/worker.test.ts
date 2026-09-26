@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { defaultPacing, loadConfig } from '../src/config.js';
-import { CheckpointError, RateLimitedError } from '../src/errors.js';
+import { CheckpointError, RateLimitedError, TaskCancelledError } from '../src/errors.js';
 import type { ScrapeContext } from '../src/linkedin/context.js';
 import { silentLogger } from '../src/log.js';
 import { Scheduler } from '../src/queue/scheduler.js';
@@ -35,6 +35,21 @@ function makeDeps(runners: Partial<Record<TaskType, TaskRunner>>) {
 }
 
 describe('Worker.runOnce', () => {
+  it('leaves a task cancelled when its runner stops on a cancellation', async () => {
+    const { deps, db } = makeDeps({
+      sync_applicants: async (task, _ctx, d) => {
+        d.db.cancelTasks({ ids: [task.id] }); // queue_cancel arrives while the list is being paged
+        throw new TaskCancelledError(task.id);
+      },
+    });
+    const id = db.enqueueTask({ type: 'sync_applicants', jobId: 'j', pagesPerRun: 12 })!;
+    const w = new Worker(deps);
+    expect(await w.runOnce()).toBe(true);
+    expect(db.taskStatus(id)).toBe('cancelled');
+    expect(db.taskCounts().failed).toBe(0);
+    expect(await w.runOnce()).toBe(false);
+  });
+
   it('lets profile tasks run when only the applicant cap is reached', async () => {
     const calls: string[] = [];
     const { deps, db, pacing } = makeDeps({

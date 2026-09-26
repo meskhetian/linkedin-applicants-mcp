@@ -61,3 +61,11 @@ export function errorMessage(err: unknown): string {
   if (err instanceof Error) return `${err.name}: ${err.message}`;
   return String(err);
 }
+
+/** The task was cancelled while it was running (queue_cancel); stop cleanly and leave it cancelled. */
+export class TaskCancelledError extends Error {
+  constructor(readonly taskId: number) {
+    super(`Task ${taskId} was cancelled while running`);
+    this.name = 'TaskCancelledError';
+  }
+}

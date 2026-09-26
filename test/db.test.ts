@@ -101,3 +101,17 @@ describe('toFtsQuery', () => {
     expect(toFtsQuery('   ')).toBe('""');
   });
 });
+
+describe('cancelling a running task', () => {
+  it('marks running tasks cancelled and a later requeue does not bring them back', () => {
+    const db = new Db(':memory:');
+    db.upsertJob({ jobId: 'j9', title: 'Closed role', status: 'closed', url: 'https://www.linkedin.com/hiring/jobs/j9/applicants/', syncedAt: now });
+    const id = db.enqueueTask({ type: 'sync_applicants', jobId: 'j9', pagesPerRun: 12 })!;
+    db.markTaskRunning(id);
+    expect(db.taskStatus(id)).toBe('running');
+    expect(db.cancelTasks({ jobId: 'j9' })).toBe(1);
+    expect(db.taskStatus(id)).toBe('cancelled');
+    db.requeueTask(id);
+    expect(db.taskStatus(id)).toBe('cancelled');
+  });
+});

@@ -40,6 +40,12 @@ changes; they are called out explicitly.
 
 - LinkedIn "Save to PDF" for profiles is skipped with a warning while Chrome downloads are denied (the option is
   reserved); the structured profile is stored as before.
+- A Hiring Pro applicant list declared itself complete after a page rendered no cards while the reported total
+  said thousands remained (a slow render or a click that landed mid-load). The crawler now waits and reads the
+  page again, leaves the list incomplete at that page so the next run retries it with a fresh navigation, and
+  only gives up after three runs end on the same blank page.
+- `queue_cancel` now also cancels a running task: a list sync stops after its current page, and a cancelled
+  task's own requeue no longer brings it back.
 - Contact details were captured for 3 of 21 applications although the Contact button was present in 20 of them:
   the SDUI button's text content carries hidden helper text, so the exact-text selector missed it. The button is
   now found by its stable data-view-name (with a contains-text fallback that excludes "Contacted"), the popover's

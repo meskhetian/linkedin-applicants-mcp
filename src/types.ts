@@ -277,6 +277,8 @@ export interface ApplicantSyncProgress {
   complete: boolean;
   /** Set when the list stopped returning cards before totalReported was reached (possible offset cap) */
   stoppedEarly?: boolean;
+  /** Hiring Pro: consecutive runs that ended on a page rendering no cards (the list gives up after three) */
+  blankRuns?: number;
   /** Which list mechanics were detected: offset URL, numbered page buttons, or infinite scroll */
   paginationMode?: 'offset' | 'buttons' | 'scroll';
   /** Which dashboard UI this job renders: legacy Ember list (offset pages, r= rating buckets) or the 2026 "Hiring Pro" list (infinite scroll, rating=ALL) */

@@ -663,9 +663,15 @@ export class Db {
   /** Put a running task back to pending without counting an attempt (e.g. checkpoint / deferred / shutdown). */
   requeueTask(id: number, runAfter?: string, note?: string): void {
     const ts = nowIso();
+    // A task cancelled while it ran stays cancelled; its own requeue must not bring it back.
     this.prep(
-      "UPDATE tasks SET status = 'pending', attempts = MAX(attempts - 1, 0), run_after = ?, last_error = COALESCE(?, last_error), updated_at = ? WHERE id = ?",
+      "UPDATE tasks SET status = 'pending', attempts = MAX(attempts - 1, 0), run_after = ?, last_error = COALESCE(?, last_error), updated_at = ? WHERE id = ? AND status <> 'cancelled'",
     ).run(runAfter ?? null, note ?? null, ts, id);
+  }
+
+  taskStatus(id: number): TaskStatus | undefined {
+    const row = this.prep('SELECT status FROM tasks WHERE id = ?').get(id) as Row | undefined;
+    return row ? (String(row.status) as TaskStatus) : undefined;
   }
 
   /** On startup: any 'running' tasks are stale (previous process died). */
@@ -674,8 +680,9 @@ export class Db {
     return Number(r.changes);
   }
 
+  /** Cancel pending tasks and mark running ones cancelled; the worker stops a running list sync at its next page. */
   cancelTasks(f: { type?: TaskType; jobId?: string; applicationId?: string; ids?: number[] } = {}): number {
-    const where: string[] = ["status = 'pending'"];
+    const where: string[] = ["status IN ('pending', 'running')"];
     const params: unknown[] = [];
     if (f.type) {
       where.push('type = ?');

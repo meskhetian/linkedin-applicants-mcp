@@ -14,7 +14,7 @@ import { URLS } from '../linkedin/urls.js';
 import { applicantDir, writeJson } from '../storage/files.js';
 import { extractResumeText } from '../storage/extract.js';
 import { randInt, sleep as realSleep } from '../browser/humanize.js';
-import { BrowserNotConnectedError, CheckpointError, DeferredError, NotLoggedInError, RateLimitedError, errorMessage, isRetryable } from '../errors.js';
+import { BrowserNotConnectedError, CheckpointError, DeferredError, NotLoggedInError, RateLimitedError, TaskCancelledError, errorMessage, isRetryable } from '../errors.js';
 
 const TASK_TYPES: TaskType[] = ['sync_jobs', 'sync_applicants', 'fetch_application', 'fetch_profile'];
 
@@ -72,7 +72,15 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
 
     sync_applicants: async (task, ctx, deps) => {
       const p = task.payload as PayloadOf<'sync_applicants'>;
-      const r = await syncApplicantList(ctx, p.jobId, { startOffset: p.startOffset, maxPages: p.pagesPerRun ?? 12, includeNotAFit: p.includeNotAFit });
+      const r = await syncApplicantList(ctx, p.jobId, {
+        startOffset: p.startOffset,
+        maxPages: p.pagesPerRun ?? 12,
+        includeNotAFit: p.includeNotAFit,
+        // queue_cancel while a list is being paged: stop after the current page instead of finishing the chunk.
+        onPage: () => {
+          if (deps.db.taskStatus(task.id) === 'cancelled') throw new TaskCancelledError(task.id);
+        },
+      });
       if (!r.complete && r.nextOffset !== undefined) {
         // Chunk finished: advance the offset and let the scheduler (hours / caps / breaks) run before the next chunk.
         deps.db.updateTaskPayload(task.id, { ...p, startOffset: r.nextOffset });
@@ -390,6 +398,11 @@ export class Worker {
 
   private async handleError(task: Task, e: unknown, tlog: Logger): Promise<void> {
     const { db, scheduler } = this.deps;
+    if (e instanceof TaskCancelledError) {
+      db.addEvent('info', 'cancelled', `${task.type} stopped: cancelled while running`, { taskId: task.id, jobId: task.jobId });
+      tlog.info('task cancelled while running; stopped after the current page');
+      return;
+    }
     const raw = errorMessage(e);
     // Only when Chrome itself is gone (crash, killed, closed by hand) does the retry policy skip the resume; a closed
     // tab produces the same Playwright text but leaves the session connected.

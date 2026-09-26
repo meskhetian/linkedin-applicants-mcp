@@ -722,7 +722,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
   const { jobId, progress } = st;
   let totalReported = progress?.totalReported;
   let stoppedEarly = false;
-  const persist = (nextPage: number, done: boolean) => {
+  const persist = (nextPage: number, done: boolean, blankRuns = 0) => {
     db.setSyncProgress({
       jobId,
       nextOffset: (nextPage - 1) * APPLICANTS_PAGE_SIZE,
@@ -731,6 +731,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
       stored: db.countApplicants(jobId),
       complete: done,
       stoppedEarly: stoppedEarly || undefined,
+      blankRuns: blankRuns || undefined,
       paginationMode: 'buttons',
       uiVariant: 'hiring_pro',
       rowsLoaded: st.seen.size,
@@ -779,7 +780,16 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
   const now = new Date().toISOString();
   let lastFirstId: string | undefined;
   for (let guard = 0; guard < 500; guard++) {
-    const rows = await collectProRows(page);
+    let rows = await collectProRows(page);
+    // A page that renders no cards while the reported total says more applicants exist is almost always a slow
+    // render or a click that landed mid-load: wait and read again before drawing any conclusion.
+    if (rows.length === 0 && (totalReported === undefined || db.countApplicants(jobId) < totalReported)) {
+      for (let attempt = 1; attempt <= 2 && rows.length === 0; attempt++) {
+        log.warn('list page rendered no applicant cards; waiting and reading again', { jobId, page: current, attempt });
+        await human.pauseMs(4000, 9000);
+        rows = await collectProRows(page);
+      }
+    }
     let newToRun = 0;
     let newToDb = 0;
     for (const r of rows) {
@@ -815,10 +825,25 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
     const firstId = rows[0]?.applicationId;
     const repeated = rows.length > 0 && firstId === lastFirstId && newToRun === 0;
     lastFirstId = firstId;
+    const remaining = totalReported !== undefined && stored < totalReported * 0.98;
+    if (rows.length === 0 && remaining) {
+      // Still nothing after the retries: leave the list incomplete at this page so the next chunk tries again
+      // (a fresh navigation), instead of declaring a 2,000-applicant list finished after a blank render.
+      const blankRuns = (progress?.blankRuns ?? 0) + 1;
+      stoppedEarly = true;
+      if (blankRuns >= 3) {
+        log.warn('hiring pro list page stayed empty in three runs; giving up on this list', { jobId, stored, totalReported, page: current });
+        persist(current, true, blankRuns);
+        return result(true, current);
+      }
+      log.warn('hiring pro list page stayed empty; will retry this page in the next run', { jobId, stored, totalReported, page: current, blankRuns });
+      persist(current, false, blankRuns);
+      return result(false, current);
+    }
     const exhausted = rows.length === 0 || repeated || (totalReported !== undefined && stored >= totalReported);
     const hasNextPage = !!(await firstVisible(page, [SEL[gen].applicants.pageButton(current + 1)], { timeoutMs: 300 })) || !!(await paginationNext(page, gen));
     if (exhausted || !hasNextPage) {
-      if (totalReported && stored < totalReported * 0.98 && rows.length > 0) {
+      if (remaining && rows.length > 0) {
         stoppedEarly = true;
         log.warn('hiring pro list ended before the reported total', { jobId, stored, totalReported, page: current, reason: repeated ? 'pagination did not advance' : 'no next page' });
       }
