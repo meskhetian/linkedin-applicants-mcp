@@ -23,7 +23,7 @@ function makeDeps(runners: Partial<Record<TaskType, TaskRunner>>) {
     cfg,
     db,
     log: silentLogger,
-    session: {} as never,
+    session: { isConnected: () => true } as never,
     scheduler,
     getPacing: () => pacing,
     ownerKind: 'cli',

@@ -205,26 +205,14 @@ async function domProfile(ctx: ScrapeContext, vanity: string, url: string, gen: 
   return profile;
 }
 
-async function saveToPdf(ctx: ScrapeContext, gen: Generation, saveDir: string): Promise<string | undefined> {
-  const { page, human, log } = ctx;
-  try {
-    const more = await firstVisible(page, SEL[gen].profile.moreButton, { timeoutMs: 3000 });
-    if (!more) return undefined;
-    await human.click(page, more);
-    await human.pause('short');
-    const item = await firstVisible(page, SEL[gen].profile.saveToPdf, { timeoutMs: 5000 });
-    if (!item) {
-      await page.keyboard.press('Escape').catch(() => {});
-      return undefined;
-    }
-    const [download] = await Promise.all([page.waitForEvent('download', { timeout: 60_000 }), human.click(page, item, { noScroll: true })]);
-    const out = path.join(saveDir, 'profile-linkedin.pdf');
-    await download.saveAs(out);
-    return out;
-  } catch (e) {
-    log.warn('save to pdf failed (optional)', { error: errorMessage(e) });
-    return undefined;
-  }
+/**
+ * LinkedIn's "Save to PDF" is a Chrome download, and Chrome 154 crashes its browser process when an
+ * automation-triggered download starts, so downloads are denied for the whole session. The structured profile
+ * (profile.json plus text) is stored instead; this stays a no-op until a download-free capture exists.
+ */
+async function saveToPdf(ctx: ScrapeContext, _gen: Generation, _saveDir: string): Promise<string | undefined> {
+  ctx.log.warn('Save to PDF is disabled: it needs a Chrome download, which crashes Chrome 154 under automation; the structured profile is stored instead');
+  return undefined;
 }
 
 // ---------------- pure text parsers (unit-tested) ----------------

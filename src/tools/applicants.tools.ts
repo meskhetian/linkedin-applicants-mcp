@@ -74,8 +74,8 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
         downloadResume: z.boolean().default(true),
         includeProfile: z.boolean().default(true).describe('Also queue the full LinkedIn profile after the application page'),
         profileDepth: DEPTH.default('full').describe("'full' visits detail sections when Voyager is unavailable; 'basic' reads only the main profile page"),
-        savePdf: z.boolean().default(false).describe('Also use LinkedIn "Save to PDF" on each profile (monthly cap enforced)'),
-        onlyMissing: z.boolean().default(true).describe('Skip applicants whose details were already fetched'),
+        savePdf: z.boolean().default(false).describe('Reserved: LinkedIn "Save to PDF" is a Chrome download, which crashes Chrome 154 under automation, so it is currently skipped with a warning; the structured profile is stored instead'),
+        onlyMissing: z.boolean().default(true).describe('Skip applicants whose details were already fetched (with downloadResume, applicants whose resume is still missing are included)'),
         limit: z.number().int().min(1).max(10000).optional().describe('Queue at most this many applicants now'),
       },
       annotations: { readOnlyHint: false, openWorldHint: true, idempotentHint: true },
@@ -86,11 +86,19 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
         for (const id of applicationIds) {
           const a = deps.db.getApplicant(id);
           if (!a) return fail(new Error(`Unknown applicationId ${id}. Run applicants_sync first.`));
-          if (onlyMissing && a.detailFetchedAt) continue;
+          const resumeMissing = downloadResume && a.hasResume !== false && !a.resumePath;
+          if (onlyMissing && a.detailFetchedAt && !resumeMissing) continue;
           targets.push({ applicationId: id, jobId: a.jobId });
         }
       } else if (jobId) {
-        targets = onlyMissing ? deps.db.applicantIdsNeeding(jobId, 'detail').map((x) => ({ applicationId: x.applicationId, jobId })) : deps.db.listApplicantIds(jobId);
+        if (onlyMissing) {
+          // Applicants without details, plus (when resumes are wanted) those whose resume is still missing.
+          const ids = new Set(deps.db.applicantIdsNeeding(jobId, 'detail').map((x) => x.applicationId));
+          if (downloadResume) for (const x of deps.db.applicantIdsNeeding(jobId, 'resume')) ids.add(x.applicationId);
+          targets = [...ids].map((applicationId) => ({ applicationId, jobId }));
+        } else {
+          targets = deps.db.listApplicantIds(jobId);
+        }
       } else {
         return fail(new Error('Provide jobId or applicationIds.'));
       }
@@ -129,7 +137,7 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
         jobId: z.string().optional(),
         applicationIds: z.array(z.string()).optional(),
         depth: DEPTH.default('full'),
-        savePdf: z.boolean().default(false),
+        savePdf: z.boolean().default(false).describe('Reserved: currently skipped with a warning (Chrome download crash), the structured profile is stored instead'),
         onlyMissing: z.boolean().default(true).describe('Skip applicants whose profile was already fetched'),
         limit: z.number().int().min(1).max(10000).optional(),
       },

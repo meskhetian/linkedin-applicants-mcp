@@ -8,7 +8,7 @@ import { createScrapeContext, type ScrapeContext } from '../linkedin/context.js'
 import { syncPostedJobs } from '../linkedin/jobs.js';
 import { syncApplicantList } from '../linkedin/applicants.js';
 import { fetchApplicationDetail } from '../linkedin/application.js';
-import { shouldSkipResumeDownload } from './resume-policy.js';
+import { BROWSER_LOST_RE, shouldSkipResumeDownload } from './resume-policy.js';
 import { fetchProfile, profileToText } from '../linkedin/profile.js';
 import { URLS } from '../linkedin/urls.js';
 import { applicantDir, writeJson } from '../storage/files.js';
@@ -367,7 +367,10 @@ export class Worker {
 
   private async handleError(task: Task, e: unknown, tlog: Logger): Promise<void> {
     const { db, scheduler } = this.deps;
-    const msg = errorMessage(e);
+    const raw = errorMessage(e);
+    // Only when Chrome itself is gone (crash, killed, closed by hand) does the retry policy skip the resume; a closed
+    // tab produces the same Playwright text but leaves the session connected.
+    const msg = !this.deps.session.isConnected() && BROWSER_LOST_RE.test(raw) ? `Browser lost: ${raw}` : raw;
     this.lastError = msg;
     db.setSetting(SETTINGS.lastError, msg);
 

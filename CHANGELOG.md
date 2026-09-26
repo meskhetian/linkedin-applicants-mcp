@@ -12,11 +12,22 @@ changes; they are called out explicitly.
 
 - **Chrome no longer crashes when a resume is opened.** Google Chrome 154 crashed its browser process
   ("Google Chrome quit unexpectedly") the moment an automation-triggered download started. Resume files are now
-  read at the network layer: the request LinkedIn makes for the file is fetched through the browser's own network
-  stack, saved, and answered with an empty 204 so the download manager never starts. Downloads are denied at the
-  context level, a stray download is cancelled, PDFs stay in Chrome's viewer, and if Chrome is still lost during
-  an application fetch the retry captures the details without the resume and records why.
-- The session logs when Chrome goes away unexpectedly and relaunches it on demand.
+  captured passively: Chrome makes every request itself, the worker reads the resume viewer's responses to learn
+  the document URL (or the file bytes when the viewer fetches them), fetches the file from inside the page, and
+  answers only a top-level navigation to a file with an empty 204 so the download manager never starts. Nothing
+  is replayed through Node, so timing, TLS fingerprint and caching stay Chrome's own. In persistent mode downloads
+  are denied at the context level and PDFs stay in Chrome's viewer (in cdp mode the attached Chrome keeps its own
+  download settings); a stray download is cancelled, and if Chrome is still lost during an application fetch the
+  retry captures the details without the resume and records why. `applicants_fetch_details` with its defaults now
+  also targets applicants whose resume is still missing.
+- The session logs when Chrome goes away unexpectedly, and a task whose page vanished during the resume step fails
+  instead of finishing without a resume, so the retry policy can react.
+- Log lines carry host and path of resume URLs only; signed tokens stay in the raw capture next to the file.
+
+### Changed
+
+- LinkedIn "Save to PDF" for profiles is skipped with a warning while Chrome downloads are denied (the option is
+  reserved); the structured profile is stored as before.
 - Hiring Pro application details: the detail pane is now isolated as the whole block from the applicant header
   down to "View full profile" instead of the header card alone, so the Contact button, the Qualifications section
   and the experience summary are read. Contact popovers without ARIA roles are captured by diffing the page text,

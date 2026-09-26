@@ -347,7 +347,7 @@ The `speed` preset scales the three caps (`slow` × 0.6, `brisk` × 1.4) and pic
 ~/.linkedin-applicants-mcp/                (LINKEDIN_MCP_DATA_DIR)
   db.sqlite                     jobs, applicants (+ resume/profile text, FTS5 index), tasks, counters, settings, events
   chrome-profile/               the dedicated Chrome profile, your LinkedIn cookies live here
-  downloads/                    Chrome's download staging directory
+  downloads/                    Chrome's default download directory (unused: resumes are read from the network)
   files/jobs/<jobId>/
     raw/                        raw applicant-list pages + the JSON LinkedIn's own app fetched
     <applicationId>_<Name>/     resume.<pdf|docx>, profile.json, profile.png, raw-application.json,
@@ -386,7 +386,7 @@ All settings are environment variables (see [.env.example](.env.example)). Pacin
 
 ## Browser modes
 
-**persistent** (default) launches your installed Chrome with the dedicated profile directory through patchright's `launchPersistentContext`: a visible window at its real size, the Chrome sandbox left on, no user-agent override, no init scripts, and only three flags (`--disable-blink-features=AutomationControlled`, `--no-first-run`, `--no-default-browser-check`). The profile's Chrome preferences are set to download PDFs instead of rendering them inline, without a download prompt.
+**persistent** (default) launches your installed Chrome with the dedicated profile directory through patchright's `launchPersistentContext`: a visible window at its real size, the Chrome sandbox left on, no user-agent override, no init scripts, and only three flags (`--disable-blink-features=AutomationControlled`, `--no-first-run`, `--no-default-browser-check`). The profile's Chrome preferences keep PDFs in Chrome's viewer and silence the download prompt; resume files are read from the network response, never downloaded, because Chrome 154 crashes when an automation-triggered download starts.
 
 **cdp** attaches to a Chrome you started yourself:
 
@@ -418,13 +418,13 @@ This drives the same SQLite queue: enqueue work from Claude, let the CLI worker 
 | --- | --- |
 | **"Could not find posted job cards / applicant cards"** | LinkedIn changed its markup (it ships two DOM generations side by side and rotates class names). `queue_pause`, then `debug_snapshot`, `debug_find` to try selectors, `debug_captures` to see the JSON the page fetched, `debug_click` to explore pagination, and update [`src/linkedin/selectors.ts`](src/linkedin/selectors.ts). Everything parsed so far is kept; raw snapshots let you re-parse offline. |
 | **Names or headlines look wrong after an update** (badge text such as "new applicant" next to a name, "Name at headline") | The list parser was fixed but your rows were stored by an older version. The server re-parses stored rows once at startup; to do it by hand, run `npm run reparse` (optionally with a job id). Nothing is fetched from LinkedIn. |
-| **"Google Chrome quit unexpectedly" while an application was being fetched** | Older versions let Chrome download the resume; Chrome 154 crashes its browser process when an automation-triggered download starts. Update: resume files are now read from the network response and downloads are denied. If Chrome is still lost during an application, the retry captures the details without the resume (event `resume-skipped`); run `applicants_fetch_details` again later to retry the resume. |
+| **"Google Chrome quit unexpectedly" while an application was being fetched** | Older versions let Chrome download the resume; Chrome 154 crashes its browser process when an automation-triggered download starts. Update: resume files are now captured passively from the viewer's own responses (nothing is downloaded or replayed) and downloads are denied. If Chrome is still lost during an application, the retry captures the details without the resume (event `resume-skipped`); run `applicants_fetch_details` for the job again later, its default selection includes applicants whose resume is still missing. |
 | **`needsHuman` in `queue_status`** | LinkedIn raised a verification, CAPTCHA, "unusual activity" or login page. Solve it in the Chrome window (or run `browser_open_login`), then `queue_resume`. |
 | **"Could not launch Chrome with profile …"** | Another Chrome window is using the dedicated profile. Close it, or switch to `cdp` mode. |
 | **List stops before the reported total (`stoppedEarly`)** | LinkedIn may cap deep pagination or hide buckets. Re-run `applicants_sync`; if it stops at the same offset, narrow the list with the dashboard's ratings/sort filters and sync again (rows are deduplicated by application id). `filterParamIgnored` means LinkedIn ignored the rating-bucket parameter and the crawler fell back to one pass with the UI filter. |
 | **Resume saved but no text** | A scanned/image PDF. The file is still on disk; OCR is not built in yet (see Roadmap). |
 | **Yellow "You are using an unsupported command-line flag" bar in Chrome** | Expected and harmless. `--disable-blink-features=AutomationControlled` is on Chrome's bad-flags list; the bar is browser UI, invisible to page JavaScript, and cannot be hidden with a flag (`--disable-infobars` was removed from Chrome in 2019). |
-| **PDFs open in a tab instead of downloading** | The profile's preferences were overwritten. With Chrome closed, delete `<data>/chrome-profile/Default/Preferences` and start again. The Hiring Pro "Download" button that opens a new tab is handled: the signed URL is fetched immediately and the tab closed. |
+| **A resume shows `hasResume` but no file** | Open the applicant's `raw-application.json` and look at `resume.debug` (`trapSeen`, `documentUrls`, `downloadsSeen`, `tabs`, `frames`): it records what the Resume control did. If `downloadsSeen` is not empty, Chrome tried to download the file and the trap did not recognise the URL; add its pattern to `RESUME_URL_RE` in [`src/linkedin/urls.ts`](src/linkedin/urls.ts). |
 | **Nothing runs** | Check `queue_status`: outside working hours (`nextWindowStart`)? Cap reached (`nextEligibleAt`)? Paused? Another process holding the owner lock (`npm run worker`)? |
 | **Where are the logs?** | stderr (Claude Desktop writes it to `~/Library/Logs/Claude/mcp*.log` on macOS) and `<data>/logs/`. |
 

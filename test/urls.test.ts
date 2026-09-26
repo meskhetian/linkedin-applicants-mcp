@@ -45,3 +45,14 @@ describe('urls', () => {
     expect(looksLikeResumeUrl('https://www.linkedin.com/in/jane/')).toBe(false);
   });
 });
+
+describe('looksLikeResumeUrl', () => {
+  it('matches document files and not profile photos or logos on the same hosts', () => {
+    expect(looksLikeResumeUrl('https://www.linkedin.com/dms/prv/document/media/v2/x/recruiter-candidate-document-pdf-analyzed/y?m=1')).toBe(true);
+    expect(looksLikeResumeUrl('https://www.linkedin.com/ambry/?x-li-ambry-ep=AQ')).toBe(true);
+    expect(looksLikeResumeUrl('https://media.licdn.com/dms/image/v2/x/profile-displayphoto-shrink_100_100/y?e=1&v=beta&t=z')).toBe(false);
+    expect(looksLikeResumeUrl('https://media.licdn.com/dms/image/v2/x/company-logo_100_100/y')).toBe(false);
+    expect(looksLikeResumeUrl('https://www.linkedin.com/dms/prv/image/v2/x/recruiter-candidate-document-cover-images_1280/y?m=1')).toBe(false);
+    expect(looksLikeResumeUrl('https://www.linkedin.com/in/someone/')).toBe(false);
+  });
+});

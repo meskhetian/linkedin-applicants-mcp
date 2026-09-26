@@ -28,10 +28,13 @@ export function decideLoggedIn(input: { url: string; hasLiAt: boolean; navVisibl
 
 /**
  * Chrome preferences we need in the dedicated profile, written while Chrome is not running (what chromedriver does):
- *  - PDFs opened in a new tab must DOWNLOAD instead of rendering in Chrome's viewer, otherwise a resume "Download"
- *    control that opens a signed URL in a new tab never produces a Playwright download event;
+ *  - PDFs stay in Chrome's viewer and never turn into downloads. Earlier versions forced the opposite so that a
+ *    resume link opening a signed URL would produce a Playwright download event; Chrome 154 then crashed its
+ *    browser process every time such a download started. Resume bytes are now read at the network layer by
+ *    ResumeTrap in src/linkedin/application.ts, so nothing may ever reach the download manager;
  *  - no download prompt; no "restore pages?" bubble after an unclean exit.
- * Idempotent: only rewrites the file when something changed.
+ * Idempotent: only rewrites the file when something changed. Applies to persistent mode; in cdp mode the profile
+ * belongs to the Chrome the user launched (scripts/launch-chrome.sh points it at the same directory).
  */
 export function ensureChromePreferences(profileDir: string, downloadsPath: string, log?: Logger): void {
   try {

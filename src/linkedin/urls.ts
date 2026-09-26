@@ -131,5 +131,11 @@ export function normalizeProfileUrl(url: string | undefined | null): string | un
 export const RESUME_URL_RE = /(\.pdf|\.docx?|mediaauth|ambry|\/dms\/|media\.licdn\.com|resumeViewer|x-li-ambry-ep|document\/media|pdf-analyzed)/i;
 
 export function looksLikeResumeUrl(url: string | undefined | null): boolean {
-  return !!url && RESUME_URL_RE.test(url) && !/\.(png|jpe?g|gif|svg|webp)(\?|$)/i.test(url) && !/\/in\//.test(url);
+  return (
+    !!url &&
+    RESUME_URL_RE.test(url) &&
+    !/\.(png|jpe?g|gif|svg|webp)(\?|$)/i.test(url) &&
+    !/\/dms\/(prv\/)?image\/|displayphoto|company-logo|cover-images|thumbnail/i.test(url) &&
+    !/\/in\//.test(url)
+  );
 }

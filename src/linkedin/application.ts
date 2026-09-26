@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Download, Locator, Page, Route } from 'patchright';
+import type { Download, Locator, Page, Request, Response, Route } from 'patchright';
 import type { ApplicantRating, ApplicationDetailResult, ScreeningAnswer } from '../types.js';
 import type { ScrapeContext } from './context.js';
 import type { Generation } from './selectors.js';
@@ -176,7 +176,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
   if (!email || !phone) {
     const more =
       (await firstVisible(root, SEL[gen].detail.contactButton, { timeoutMs: 1200 })) ??
-      (await firstVisible(root, ['button:has-text("Contact")'], { timeoutMs: 400 })) ??
+      (await firstVisible(root, ['button:text-matches("^\\s*Contact( info)?\\s*$", "i")'], { timeoutMs: 400 })) ??
       (await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 1000 }));
     contactDiag.found = !!more;
     if (more) {
@@ -376,7 +376,7 @@ async function detectRatingOnPage(page: Page, gen: Generation): Promise<Applican
 interface ResumeOutcome {
   path?: string;
   fileName?: string;
-  strategy: 'attachment' | 'viewer' | 'intercept' | 'download' | 'popup' | 'none';
+  strategy: 'attachment' | 'viewer' | 'intercept' | 'popup' | 'none';
   hasResume: boolean;
   host?: string;
   /** What the page looked like after the Resume control was used, when no file could be retrieved. */
@@ -400,11 +400,11 @@ async function resumeDebugInfo(ctx: ScrapeContext, mark: number): Promise<Record
   const tabs = page
     .context()
     .pages()
-    .map((p) => p.url().slice(0, 200));
+    .map((p) => redactUrl(p.url()));
   const fetched = ctx.capture
     .since(mark)
     .filter((e) => /pdf|ambry|\/dms\/|mediaauth|resume|document/i.test(`${e.url} ${e.contentType}`))
-    .map((e) => ({ url: e.url.slice(0, 200), status: e.status, contentType: e.contentType }))
+    .map((e) => ({ url: redactUrl(e.url), status: e.status, contentType: e.contentType }))
     .slice(0, 20);
   return { url: page.url(), tabs, ...dom, fetched };
 }
@@ -419,9 +419,17 @@ interface Saved {
 
 /** True when the first bytes read like text (JSON, RSC flight data, HTML): never a resume file. */
 export function looksTextual(bytes: Buffer | Uint8Array): boolean {
-  const head = Buffer.from(bytes.subarray(0, 64)).toString('utf8').replace(/^\uFEFF/, '');
-  if (!head.trim()) return false;
-  return /^[\x09\x0a\x0d\x20-\x7e\u00a0-\uffff]+$/.test(head) && !/^%PDF-|^PK\x03\x04|^\{\\rtf/.test(head);
+  const head = Buffer.from(bytes.subarray(0, 64));
+  if (!head.length) return false;
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(head).replace(/^\uFEFF/, '');
+  } catch {
+    return false; // invalid UTF-8: binary
+  }
+  if (!text.trim()) return false;
+  // Control characters other than tab, newline and carriage return do not occur in text payloads.
+  return !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text);
 }
 
 const DOCUMENT_CT_RE = /application\/(pdf|msword|vnd\.openxmlformats-officedocument|rtf)/i;
@@ -452,92 +460,163 @@ export function decideResumeIntercept(input: {
   const textual = looksTextual(input.bytes);
   // Sniffed magic bytes win; a document content type counts; octet-stream or an attachment header only when the
   // bytes are not plain text (LinkedIn's viewer payloads are text and must never be mistaken for a resume).
-  const isFile = !!sniffExt(input.bytes) || (!textual && (DOCUMENT_CT_RE.test(ct) || /application\/octet-stream/i.test(ct) || /attachment/i.test(cd)));
+  const isFile =
+    !!sniffExt(input.bytes) ||
+    (!textual &&
+      (DOCUMENT_CT_RE.test(ct) ||
+        /application\/octet-stream/i.test(ct) ||
+        /attachment/i.test(cd) ||
+        // A navigation to a resume-looking URL that answers with unknown binary bytes is still the file.
+        (input.resourceType === 'document' && looksLikeResumeUrl(input.url) && input.bytes.length > 1000)));
   // A navigation to a file (same tab or popup) or any attachment would start a Chrome download: answer it ourselves.
   const swallow = isFile && (input.resourceType === 'document' || /attachment/i.test(cd) || !input.fromWorkingPage);
   return { isFile, swallow };
 }
 
+/** Where an intercepted request comes from: the tab we work in, a popup that tab opened, or an unrelated tab. */
+export type TrapOrigin = 'working' | 'popup' | 'other';
+
+/** Host and path only (signed tokens live in the query string), for log lines. Full URLs stay in the raw capture. */
+export function redactUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.host}${u.pathname}`.slice(0, 160);
+  } catch {
+    return (url.split('?')[0] ?? url).slice(0, 160);
+  }
+}
+
+/** A regular LinkedIn page (not a file host, not a document path), e.g. the applicant list opened in a new tab. */
+function isLinkedInPageUrl(url: string): boolean {
+  return /^https:\/\/www\.linkedin\.com\//i.test(url) && !looksLikeResumeUrl(url) && !/\/dms\/|ambry|mediaauth/i.test(url);
+}
+
+/** Lower is better: the analysed PDF first, then other document files, then anything else that was swallowed. */
+export function scoreDocumentUrl(url: string): number {
+  if (/pdf-analyzed/i.test(url)) return 0;
+  if (/\/dms\/prv\/document\//i.test(url) && !/manifest|cover-image|thumbnail/i.test(url)) return 1;
+  return looksLikeResumeUrl(url) ? 2 : 3;
+}
+
 /**
- * Captures the resume at the network layer so Chrome's download manager never starts. Chrome 154 crashed its
- * browser process three times in a row the moment an automation-triggered download began, so requests that
- * look like a resume file (or any navigation inside a popup we opened) are fetched through the browser's own
- * network stack (route.fetch: same cookies and headers), saved, and then answered with 204 when they would have
- * become a download, or passed through unchanged when LinkedIn's inline viewer requested them.
+ * Pure decision for the network trap. Only a top-level navigation can turn into a Chrome download, so only those
+ * are answered by us (an empty 204, nothing is fetched or replayed); every other request continues untouched.
+ * Popups the working tab opened may load ordinary LinkedIn pages; anything else they navigate to is a file.
+ * Requests from unrelated tabs are never touched.
+ */
+export function classifyTrapRequest(input: { url: string; isTopLevelNavigation: boolean; origin: TrapOrigin }): { swallow: boolean } {
+  if (input.origin === 'other' || !input.isTopLevelNavigation) return { swallow: false };
+  if (looksLikeResumeUrl(input.url)) return { swallow: true };
+  return { swallow: input.origin === 'popup' && !isLinkedInPageUrl(input.url) };
+}
+
+/**
+ * Passive network capture around a Resume click, so Chrome's download manager never starts. Chrome 154 crashed
+ * its browser process three times in a row the moment an automation-triggered download began (first as a real
+ * download, then again with Playwright's download handling). Chrome still makes every request itself: the trap
+ * only listens to responses of the working tab and of popups that tab opened (the resume viewer payload names
+ * the document files, and the viewer may fetch the file itself), and it answers top-level navigations to a file
+ * with an empty 204 instead of letting them become downloads. Nothing is replayed through Node, so timing,
+ * TLS fingerprint and caching stay Chrome's own.
  */
 class ResumeTrap {
   private saved: Saved | undefined;
-  private resolvers: Array<(s: Saved | undefined) => void> = [];
+  private resolvers: Array<() => void> = [];
   private armed = false;
+  /** Redacted URLs of navigations the trap answered, for the raw capture. */
   readonly seen: string[] = [];
-  /** Document URLs named inside viewer payloads, best first. */
+  /** Document URLs seen in viewer payloads or swallowed navigations. */
   readonly documentUrls = new Set<string>();
+  private readonly popups = new Set<Page>();
+  private readonly pending = new Set<Promise<void>>();
 
   constructor(
     private readonly ctx: ScrapeContext,
     private readonly saveDir: string,
   ) {}
 
-  private readonly handler = async (route: Route): Promise<void> => {
+  private originOf(req: Request): TrapOrigin {
+    try {
+      const page = req.frame().page();
+      if (page === this.ctx.page) return 'working';
+      return this.popups.has(page) ? 'popup' : 'other';
+    } catch {
+      return 'other';
+    }
+  }
+
+  private readonly onPopup = (p: Page): void => {
+    this.popups.add(p);
+  };
+
+  private readonly onRoute = async (route: Route): Promise<void> => {
     const req = route.request();
     const url = req.url();
-    let fromWorkingPage = true;
+    let topLevel = false;
     try {
-      fromWorkingPage = req.frame().page() === this.ctx.page;
+      topLevel = req.isNavigationRequest() && req.frame() === req.frame().page().mainFrame();
     } catch {
-      /* detached frame */
+      /* detached */
     }
-    const type = req.resourceType();
-    // Resume-looking URLs anywhere, everything a popup loads, and the LinkedIn fetch/XHR calls the click triggers
-    // (the resume viewer payload names the document files; see findDocumentUrls).
-    const candidate = looksLikeResumeUrl(url) || (!fromWorkingPage && (type === 'document' || req.isNavigationRequest())) || ((type === 'fetch' || type === 'xhr') && /linkedin\.com\//.test(url));
-    if (!candidate) {
+    const { swallow } = classifyTrapRequest({ url, isTopLevelNavigation: topLevel, origin: this.originOf(req) });
+    if (!swallow) {
       await route.continue().catch(() => {});
       return;
     }
-    this.seen.push(url.slice(0, 200));
-    try {
-      const resp = await route.fetch({ maxRedirects: 5 });
-      const headers = resp.headers();
-      const body = await resp.body();
-      const { isFile, swallow } = decideResumeIntercept({
-        url,
-        resourceType: req.resourceType(),
-        contentType: headers['content-type'],
-        contentDisposition: headers['content-disposition'],
-        bytes: body,
-        fromWorkingPage,
-      });
-      if (isFile && !this.saved) {
-        const s = saveBytes(body, headers['content-type'], headers['content-disposition'], resp.url(), this.saveDir);
-        if (s) {
-          this.saved = { ...s, host: safeHost(resp.url()), url: resp.url() };
-          this.ctx.log.debug('resume captured at the network layer', { url: url.slice(0, 200), bytes: body.length, swallow });
-          this.settle();
+    this.seen.push(redactUrl(url));
+    this.documentUrls.add(url);
+    await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } }).catch(() => {});
+    this.settle();
+  };
+
+  private readonly onResponse = (resp: Response): void => {
+    const req = resp.request();
+    if (this.originOf(req) === 'other') return;
+    const type = req.resourceType();
+    const ct = resp.headers()['content-type'] ?? '';
+    const url = resp.url();
+    const job = (async () => {
+      if ((type === 'fetch' || type === 'xhr' || type === 'document') && /linkedin\.com\//i.test(url) && /json|x-component|javascript|html|text/i.test(ct)) {
+        const text = await resp.text().catch(() => '');
+        if (text && text.length < 4_000_000) {
+          let added = false;
+          for (const u of findDocumentUrls(text)) if (!this.documentUrls.has(u)) (this.documentUrls.add(u), (added = true));
+          if (added) this.settle();
         }
-      } else if (!isFile && body.length < 4_000_000 && looksTextual(body)) {
-        for (const u of findDocumentUrls(body.toString('utf8'))) this.documentUrls.add(u);
+      } else if (!this.saved && type !== 'document' && (DOCUMENT_CT_RE.test(ct) || looksLikeResumeUrl(url))) {
+        // The viewer fetched the file itself: Chrome made the request, we only read the bytes.
+        const body = await resp.body().catch(() => undefined);
+        if (body && !looksTextual(body)) {
+          const s = saveBytes(body, ct, resp.headers()['content-disposition'], url, this.saveDir);
+          if (s) {
+            this.saved = { ...s, host: safeHost(url), url };
+            this.ctx.log.debug('resume read from the viewer response', { url: redactUrl(url), bytes: body.length });
+            this.settle();
+          }
+        }
       }
-      if (swallow) await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } });
-      else await route.fulfill({ response: resp, body });
-    } catch (e) {
-      this.ctx.log.debug('resume intercept failed', { url: url.slice(0, 200), error: errorMessage(e) });
-      // Never let a navigation to a file reach the download manager, even when our own fetch failed.
-      if (req.resourceType() === 'document' && looksLikeResumeUrl(url)) await route.abort('aborted').catch(() => {});
-      else await route.continue().catch(() => {});
-    }
+    })();
+    this.pending.add(job);
+    void job.finally(() => this.pending.delete(job));
   };
 
   async arm(): Promise<void> {
     if (this.armed) return;
     this.armed = true;
-    await this.ctx.page.context().route('**/*', this.handler);
+    const context = this.ctx.page.context();
+    this.ctx.page.on('popup', this.onPopup);
+    context.on('response', this.onResponse);
+    await context.route('**/*', this.onRoute);
   }
 
   async disarm(): Promise<void> {
     if (!this.armed) return;
     this.armed = false;
-    await this.ctx.page.context().unroute('**/*', this.handler).catch(() => {});
+    const context = this.ctx.page.context();
+    this.ctx.page.off('popup', this.onPopup);
+    context.off('response', this.onResponse);
+    await context.unroute('**/*', this.onRoute).catch(() => {});
+    await Promise.allSettled([...this.pending]);
     this.settle();
   }
 
@@ -545,17 +624,22 @@ class ResumeTrap {
     return this.saved;
   }
 
-  /** Resolves with the captured file, or undefined after `timeoutMs`. */
-  wait(timeoutMs: number): Promise<Saved | undefined> {
-    if (this.saved) return Promise.resolve(this.saved);
+  /** Candidate document URLs, best first. */
+  candidates(): string[] {
+    return [...this.documentUrls].sort((a, b) => scoreDocumentUrl(a) - scoreDocumentUrl(b));
+  }
+
+  /** Resolves when a file or a document URL shows up, or after `timeoutMs`. */
+  wait(timeoutMs: number): Promise<void> {
+    if (this.saved || this.documentUrls.size) return Promise.resolve();
     return new Promise((resolve) => {
-      const done = (s: Saved | undefined) => {
+      const done = () => {
         clearTimeout(timer);
-        resolve(s);
+        resolve();
       };
       const timer = setTimeout(() => {
         this.resolvers = this.resolvers.filter((r) => r !== done);
-        resolve(undefined);
+        resolve();
       }, timeoutMs);
       this.resolvers.push(done);
     });
@@ -564,15 +648,21 @@ class ResumeTrap {
   private settle(): void {
     const rs = this.resolvers;
     this.resolvers = [];
-    for (const r of rs) r(this.saved);
+    for (const r of rs) r();
   }
+}
+
+/** The Chrome process or the working tab is gone: let the task fail so the retry policy can react. */
+function assertPageAlive(page: Page): void {
+  if (page.isClosed()) throw new Error('Target page, context or browser has been closed during the resume step');
 }
 
 /**
  * Layered capture, in order: direct file href on the page → "Download resume" link/menu item → Resume control
- * (which may open a viewer with an iframe/embed, open the signed URL in a NEW TAB, or expose a Download control).
- * Every click runs with the network trap armed, so the file is read from the response itself; Chrome's download
- * manager is never involved (downloads are denied at the context level and cancelled if one still starts).
+ * (opens LinkedIn's resume viewer, a new tab with the signed URL, or exposes a Download control). Every click runs
+ * with the passive trap armed: the file is read from the viewer's own responses or fetched from inside the page
+ * once its URL is known; Chrome's download manager is never involved (downloads are denied at the context level
+ * and cancelled if one still starts).
  */
 async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator | Page, links: Array<{ href: string; text: string }>, saveDir: string): Promise<ResumeOutcome> {
   const { page, human, log } = ctx;
@@ -596,8 +686,8 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
   const trap = new ResumeTrap(ctx, saveDir);
   const downloadsSeen: string[] = [];
   const onDownload = (dl: Download) => {
-    downloadsSeen.push(dl.url().slice(0, 200));
-    log.warn('Chrome started a download despite the network trap; cancelling it', { url: dl.url().slice(0, 200) });
+    downloadsSeen.push(redactUrl(dl.url()));
+    log.warn('Chrome started a download despite the network trap; cancelling it', { url: redactUrl(dl.url()) });
     dl.cancel().catch(() => {});
   };
   await trap.arm();
@@ -628,7 +718,7 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
       }
     }
 
-    // (c) Resume control → popup with the signed URL / viewer / direct file
+    // (c) Resume control → viewer payload / popup with the signed URL / direct file
     const btn = (await firstVisible(root, SEL[gen].detail.resumeButton, { timeoutMs: 1500 })) ?? (await firstVisible(page, SEL[gen].detail.resumeButton, { timeoutMs: 500 }));
     if (!btn) {
       const t = await mainText(page, 20_000);
@@ -641,15 +731,7 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
     }
     const direct = await clickAndTrap(ctx, btn, trap, saveDir, 8000);
     if (direct) return { ...direct, hasResume: true };
-
-    // The viewer payload names the document files: fetch the best one ourselves (same-origin, cookies included).
-    for (const docUrl of [...trap.documentUrls].slice(0, 2)) {
-      const saved = await fetchResume(ctx, docUrl, saveDir);
-      if (saved) {
-        await closeViewer();
-        return { ...saved, strategy: 'viewer', hasResume: true };
-      }
-    }
+    assertPageAlive(page);
 
     // viewer opened: look for the file inside it
     let url: string | undefined;
@@ -690,12 +772,21 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
         return { ...got, hasResume: true };
       }
     }
+    assertPageAlive(page);
     const debug = await resumeDebugInfo(ctx, mark);
     debug.trapSeen = trap.seen.slice(0, 20);
-    debug.documentUrls = [...trap.documentUrls].slice(0, 5);
+    debug.documentUrls = trap.candidates().slice(0, 5);
     debug.downloadsSeen = downloadsSeen;
     await closeViewer();
-    log.warn('resume control found but no file could be retrieved', { url: page.url(), viewerUrl: url, tabs: debug.tabs, frames: debug.frames, fetched: debug.fetched, trapSeen: debug.trapSeen });
+    log.warn('resume control found but no file could be retrieved', {
+      url: redactUrl(page.url()),
+      viewerUrl: url ? redactUrl(url) : undefined,
+      tabs: debug.tabs,
+      frames: (debug.frames as string[]).map(redactUrl),
+      fetched: debug.fetched,
+      trapSeen: debug.trapSeen,
+      documentUrls: (debug.documentUrls as string[]).map(redactUrl),
+    });
     return { strategy: 'none', hasResume: true, debug };
   } finally {
     page.off('download', onDownload);
@@ -704,36 +795,45 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
 }
 
 /**
- * Click a control with the network trap armed and collect whatever it produces: a file answered at the network
- * layer (same tab or popup), or a popup whose URL we can fetch ourselves. Popups are closed only after the trap
- * has settled, so no download is ever in flight when a tab goes away. Returns undefined when a viewer opened
- * instead (the caller inspects the DOM).
+ * Click a control with the passive trap armed. The file may arrive as a viewer response (read directly), as a
+ * document URL named in the viewer payload or swallowed from a navigation (fetched from inside the page), or in a
+ * popup whose URL we can fetch. Popups are closed only after the trap has settled, so no download is ever in
+ * flight when a tab goes away. Returns undefined when a viewer opened and nothing was found yet.
  */
 async function clickAndTrap(ctx: ScrapeContext, control: Locator, trap: ResumeTrap, saveDir: string, timeoutMs: number, noScroll = false): Promise<(Saved & { strategy: ResumeOutcome['strategy'] }) | undefined> {
   const { page, human, log } = ctx;
   const popupP = page.waitForEvent('popup', { timeout: Math.min(timeoutMs, 6000) }).catch(() => null);
   await human.click(page, control, { noScroll });
   await human.pause('short');
-  let saved = await trap.wait(timeoutMs);
+  await trap.wait(timeoutMs);
+  assertPageAlive(page);
   const popup = await popupP;
-  if (popup) {
-    try {
-      if (!saved) {
-        await popup.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => {});
-        const url = popup.url();
-        log.debug('resume popup opened', { url: url.slice(0, 200) });
-        if (looksLikeResumeUrl(url) || /ambry|dms|mediaauth|licdn/i.test(url)) {
-          saved = (await fetchResume(ctx, url, saveDir)) ?? (await fetchResume(ctx, url, saveDir, popup));
-          if (saved) return { ...saved, strategy: 'popup' };
-        }
-        saved = await trap.wait(3000);
+  try {
+    const got = trap.result();
+    if (got) return { ...got, strategy: 'intercept' };
+    for (const docUrl of trap.candidates().slice(0, 2)) {
+      const saved = await fetchResume(ctx, docUrl, saveDir);
+      if (saved) return { ...saved, strategy: 'viewer' };
+    }
+    if (popup) {
+      await popup.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => {});
+      const url = popup.url();
+      log.debug('resume popup opened', { url: redactUrl(url) });
+      if (looksLikeResumeUrl(url) || /ambry|dms|mediaauth|licdn/i.test(url)) {
+        const saved = (await fetchResume(ctx, url, saveDir)) ?? (await fetchResume(ctx, url, saveDir, popup));
+        if (saved) return { ...saved, strategy: 'popup' };
       }
-    } finally {
+      await trap.wait(3000);
+      const late = trap.result();
+      if (late) return { ...late, strategy: 'intercept' };
+    }
+    return undefined;
+  } finally {
+    if (popup) {
       await popup.close().catch(() => {});
       await page.bringToFront().catch(() => {});
     }
   }
-  return saved ? { ...saved, strategy: 'intercept' } : undefined;
 }
 
 function absolutize(url: string, base: string): string {
@@ -759,17 +859,19 @@ async function fetchResume(ctx: ScrapeContext, url: string, saveDir: string, fro
     }, url);
     const saved = saveBytes(Buffer.from(res.b64, 'base64'), res.ct, res.cd, res.finalUrl || url, saveDir);
     if (saved) return { ...saved, host, url: res.finalUrl || url };
-    ctx.log.debug('resume url returned html/empty (login wall or expired link)', { url: url.slice(0, 200), ct: res.ct });
+    ctx.log.debug('resume url returned html/empty (login wall or expired link)', { url: redactUrl(url), ct: res.ct });
   } catch (e) {
-    ctx.log.debug('in-page resume fetch failed; trying context request', { url: url.slice(0, 200), error: errorMessage(e) });
+    ctx.log.debug('in-page resume fetch failed; trying context request', { url: redactUrl(url), error: errorMessage(e) });
   }
+  // Last resort only (cross-origin file hosts refuse in-page reads): this request leaves through Node, not Chrome.
   try {
+    ctx.log.debug('fetching resume through the context request API', { url: redactUrl(url) });
     const r = await ctx.page.context().request.get(url, { headers: { referer: 'https://www.linkedin.com/' }, maxRedirects: 5, timeout: 30_000 });
     if (!r.ok()) return undefined;
     const saved = saveBytes(await r.body(), r.headers()['content-type'], r.headers()['content-disposition'], r.url(), saveDir);
     return saved ? { ...saved, host, url: r.url() } : undefined;
   } catch (e) {
-    ctx.log.debug('context request for resume failed', { url: url.slice(0, 200), error: errorMessage(e) });
+    ctx.log.debug('context request for resume failed', { url: redactUrl(url), error: errorMessage(e) });
     return undefined;
   }
 }
