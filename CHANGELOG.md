@@ -13,9 +13,8 @@ changes; they are called out explicitly.
 - **Chrome no longer crashes when a resume is opened.** Google Chrome 154 crashed its browser process
   ("Google Chrome quit unexpectedly") the moment an automation-triggered download started. Resume files are now
   captured passively: Chrome makes every request itself, the worker reads the resume viewer's responses to learn
-  the document URL (or the file bytes when the viewer fetches them), fetches the file from inside the page, and
-  answers only a top-level navigation to a file with an empty 204 so the download manager never starts. Nothing
-  is replayed through Node, so timing, TLS fingerprint and caching stay Chrome's own. Downloads are denied at the
+  the document URL (or the file bytes when the viewer fetches them) and fetches the file from inside the page.
+  Nothing is intercepted or replayed, so timing, headers, HTTP cache and TLS fingerprint stay Chrome's own. Downloads are denied at the
   context level (in cdp mode through a browser-level CDP command) and PDFs stay in Chrome's viewer; a stray
   download is cancelled, and if Chrome is still lost during an application fetch the
   retry captures the details without the resume and records why. `applicants_fetch_details` with its defaults now

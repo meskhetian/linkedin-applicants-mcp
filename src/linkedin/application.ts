@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Download, Locator, Page, Request, Response, Route } from 'patchright';
+import type { Download, Locator, Page, Request, Response } from 'patchright';
 import type { ApplicantRating, ApplicationDetailResult, ScreeningAnswer } from '../types.js';
 import type { ScrapeContext } from './context.js';
 import type { Generation } from './selectors.js';
@@ -486,28 +486,11 @@ export function redactUrl(url: string): string {
   }
 }
 
-/** A regular LinkedIn page (not a file host, not a document path), e.g. the applicant list opened in a new tab. */
-function isLinkedInPageUrl(url: string): boolean {
-  return /^https:\/\/www\.linkedin\.com\//i.test(url) && !looksLikeResumeUrl(url) && !/\/dms\/|ambry|mediaauth/i.test(url);
-}
-
 /** Lower is better: the analysed PDF first, then other document files, then anything else that was swallowed. */
 export function scoreDocumentUrl(url: string): number {
   if (/pdf-analyzed/i.test(url)) return 0;
   if (/\/dms\/prv\/document\//i.test(url) && !/manifest|cover-image|thumbnail/i.test(url)) return 1;
   return looksLikeResumeUrl(url) ? 2 : 3;
-}
-
-/**
- * Pure decision for the network trap. Only a top-level navigation can turn into a Chrome download, so only those
- * are answered by us (an empty 204, nothing is fetched or replayed); every other request continues untouched.
- * Popups the working tab opened may load ordinary LinkedIn pages; anything else they navigate to is a file.
- * Requests from unrelated tabs are never touched.
- */
-export function classifyTrapRequest(input: { url: string; isTopLevelNavigation: boolean; origin: TrapOrigin }): { swallow: boolean } {
-  if (input.origin === 'other' || !input.isTopLevelNavigation) return { swallow: false };
-  if (looksLikeResumeUrl(input.url)) return { swallow: true };
-  return { swallow: input.origin === 'popup' && !isLinkedInPageUrl(input.url) };
 }
 
 /** Long-lived or streaming responses (LinkedIn's realtime event stream, tracking beacons) must never be awaited. */
@@ -539,21 +522,21 @@ function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
 }
 
 /**
- * Passive network capture around a Resume click, so Chrome's download manager never starts. Chrome 154 crashed
- * its browser process three times in a row the moment an automation-triggered download began (first as a real
- * download, then again with Playwright's download handling). Chrome still makes every request itself: the trap
- * only listens to responses of the working tab and of popups that tab opened (the resume viewer payload names
- * the document files, and the viewer may fetch the file itself), and it answers top-level navigations to a file
- * with an empty 204 instead of letting them become downloads. Nothing is replayed through Node, so timing,
- * TLS fingerprint and caching stay Chrome's own.
+ * Passive network capture around a Resume click. Chrome 154 crashed its browser process three times in a row the
+ * moment an automation-triggered download began, so downloads are denied for the session and the profile's
+ * download history is cleared before every launch (the upstream trigger, see clearDownloadHistory). Nothing is
+ * intercepted or replayed: Chrome makes every request itself with its own cache, headers and TLS stack. The trap
+ * only listens to the responses of the working tab and of popups that tab opened. The resume viewer payload names
+ * the document files, and the viewer may fetch the file itself; either way the bytes come from Chrome's own
+ * responses or from an in-page fetch of the named URL.
  */
 class ResumeTrap {
   private saved: Saved | undefined;
   private resolvers: Array<() => void> = [];
   private armed = false;
-  /** Redacted URLs of navigations the trap answered, for the raw capture. */
+  /** Redacted URLs of popups the click opened, for the raw capture. */
   readonly seen: string[] = [];
-  /** Document URLs seen in viewer payloads or swallowed navigations. */
+  /** Document URLs seen in viewer payloads. */
   readonly documentUrls = new Set<string>();
   private readonly popups = new Set<Page>();
   private readonly pending = new Set<Promise<void>>();
@@ -575,30 +558,7 @@ class ResumeTrap {
 
   private readonly onPopup = (p: Page): void => {
     this.popups.add(p);
-  };
-
-  private readonly onRoute = async (route: Route): Promise<void> => {
-    const req = route.request();
-    const url = req.url();
-    let topLevel = false;
-    try {
-      topLevel = req.isNavigationRequest() && req.frame() === req.frame().page().mainFrame();
-    } catch {
-      /* detached */
-    }
-    const { swallow } = classifyTrapRequest({ url, isTopLevelNavigation: topLevel, origin: this.originOf(req) });
-    if (!swallow) {
-      await route.continue().catch(() => {});
-      return;
-    }
-    this.seen.push(redactUrl(url));
-    this.documentUrls.add(url);
-    // The working tab keeps its page (204 does not commit); a popup gets a blank page that commits, so Playwright
-    // reports it and clickAndTrap can close it.
-    const origin = this.originOf(req);
-    if (origin === 'popup') await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title></title>' }).catch(() => {});
-    else await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } }).catch(() => {});
-    this.settle();
+    this.seen.push(redactUrl(p.url()));
   };
 
   private readonly onResponse = (resp: Response): void => {
@@ -634,22 +594,18 @@ class ResumeTrap {
     void job.finally(() => this.pending.delete(job));
   };
 
-  async arm(): Promise<void> {
+  arm(): void {
     if (this.armed) return;
     this.armed = true;
-    const context = this.ctx.page.context();
     this.ctx.page.on('popup', this.onPopup);
-    context.on('response', this.onResponse);
-    await context.route('**/*', this.onRoute);
+    this.ctx.page.context().on('response', this.onResponse);
   }
 
   async disarm(): Promise<void> {
     if (!this.armed) return;
     this.armed = false;
-    const context = this.ctx.page.context();
     this.ctx.page.off('popup', this.onPopup);
-    context.off('response', this.onResponse);
-    await context.unroute('**/*', this.onRoute).catch(() => {});
+    this.ctx.page.context().off('response', this.onResponse);
     // Body reads are bounded themselves; never let a straggler hold the task.
     await withTimeout(Promise.allSettled([...this.pending]), 3000, []);
     this.settle();
@@ -702,8 +658,8 @@ function assertPageAlive(page: Page): void {
  * Layered capture, in order: direct file href on the page → "Download resume" link/menu item → Resume control
  * (opens LinkedIn's resume viewer, a new tab with the signed URL, or exposes a Download control). Every click runs
  * with the passive trap armed: the file is read from the viewer's own responses or fetched from inside the page
- * once its URL is known; Chrome's download manager is never involved (downloads are denied at the context level
- * and cancelled if one still starts).
+ * once its URL is known. Downloads are denied for the session and cancelled if one still starts; links with a
+ * download attribute are fetched, never clicked.
  */
 async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator | Page, links: Array<{ href: string; text: string }>, saveDir: string): Promise<ResumeOutcome> {
   const { page, human, log } = ctx;
@@ -728,10 +684,10 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
   const downloadsSeen: string[] = [];
   const onDownload = (dl: Download) => {
     downloadsSeen.push(redactUrl(dl.url()));
-    log.warn('Chrome started a download despite the network trap; cancelling it', { url: redactUrl(dl.url()) });
+    log.warn('Chrome started a download (denied for this session); cancelling it', { url: redactUrl(dl.url()) });
     dl.cancel().catch(() => {});
   };
-  await trap.arm();
+  trap.arm();
   page.on('download', onDownload);
   try {
     // (b) legacy "Download resume" link (direct) or menu item under "More"
@@ -862,9 +818,9 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
 
 /**
  * Click a control with the passive trap armed. The file may arrive as a viewer response (read directly), as a
- * document URL named in the viewer payload or swallowed from a navigation (fetched from inside the page), or in a
- * popup whose URL we can fetch. Popups are closed only after the trap has settled, so no download is ever in
- * flight when a tab goes away. Returns undefined when a viewer opened and nothing was found yet.
+ * document URL named in the viewer payload (fetched from inside the page), or in a popup whose URL we can fetch.
+ * Popups are closed only after the trap has settled. Returns undefined when a viewer opened and nothing was
+ * found yet.
  */
 async function clickAndTrap(ctx: ScrapeContext, control: Locator, trap: ResumeTrap, saveDir: string, timeoutMs: number, noScroll = false): Promise<(Saved & { strategy: ResumeOutcome['strategy'] }) | undefined> {
   const { page, human, log } = ctx;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyTrapRequest, decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, redactUrl, scoreDocumentUrl, shouldReadResponseBody, sliceBetween, sniffExt } from '../src/linkedin/application.js';
+import { decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, redactUrl, scoreDocumentUrl, shouldReadResponseBody, sliceBetween, sniffExt } from '../src/linkedin/application.js';
 
 describe('filenameFromContentDisposition', () => {
   it('handles plain, quoted and RFC 5987 forms', () => {
@@ -115,21 +115,6 @@ describe('viewer payloads are text, not resumes', () => {
       'https://www.linkedin.com/dms/prv/document/media/v2/D562/other-document/B56/0/1?m=1',
     ]);
     expect(findDocumentUrls('nothing here')).toEqual([]);
-  });
-});
-
-describe('classifyTrapRequest', () => {
-  it('ignores unrelated tabs and everything that is not a top-level navigation', () => {
-    expect(classifyTrapRequest({ url: 'https://media.licdn.com/dms/document/x.pdf', isTopLevelNavigation: true, origin: 'other' })).toEqual({ swallow: false });
-    expect(classifyTrapRequest({ url: 'https://media.licdn.com/dms/document/x.pdf', isTopLevelNavigation: false, origin: 'working' })).toEqual({ swallow: false });
-    expect(classifyTrapRequest({ url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1', isTopLevelNavigation: false, origin: 'popup' })).toEqual({ swallow: false });
-  });
-
-  it('answers navigations to files itself, and lets popups load ordinary LinkedIn pages', () => {
-    expect(classifyTrapRequest({ url: 'https://media.licdn.com/dms/document/x.pdf', isTopLevelNavigation: true, origin: 'working' })).toEqual({ swallow: true });
-    expect(classifyTrapRequest({ url: 'https://example.cdn/signed', isTopLevelNavigation: true, origin: 'popup' })).toEqual({ swallow: true });
-    expect(classifyTrapRequest({ url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1&jobId=2', isTopLevelNavigation: true, origin: 'popup' })).toEqual({ swallow: false });
-    expect(classifyTrapRequest({ url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1&jobId=2', isTopLevelNavigation: true, origin: 'working' })).toEqual({ swallow: false });
   });
 });
 
