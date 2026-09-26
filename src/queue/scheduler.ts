@@ -2,7 +2,8 @@ import type { Db } from '../storage/db.js';
 import type { PacingSettings, TaskType } from '../types.js';
 import { randInt, type Rng } from '../browser/humanize.js';
 
-export type ScheduleDecision = { ok: true } | { ok: false; reason: string; resumeAt: Date };
+/** `scope: 'type'` blocks only that task type (a daily cap); everything else blocks the whole queue. */
+export type ScheduleDecision = { ok: true } | { ok: false; reason: string; resumeAt: Date; scope: 'type' | 'global' };
 
 interface LocalParts {
   year: number;
@@ -197,24 +198,24 @@ export class Scheduler {
     const p = this.getPacing();
     const caps = this.effectiveCaps(d);
     if (this.breakUntil && this.breakUntil.getTime() > d.getTime()) {
-      return { ok: false, reason: 'on a break', resumeAt: this.breakUntil };
+      return { ok: false, reason: 'on a break', resumeAt: this.breakUntil, scope: 'global' };
     }
     if (!this.inWorkWindow(d)) {
-      return { ok: false, reason: 'outside working hours', resumeAt: this.nextWindowStart(d) };
+      return { ok: false, reason: 'outside working hours', resumeAt: this.nextWindowStart(d), scope: 'global' };
     }
     const today = this.todayCounts(d);
     if (type === 'fetch_application' && today.applicants >= caps.applicants) {
-      return { ok: false, reason: `daily applicant cap reached (${today.applicants}/${caps.applicants})`, resumeAt: this.nextDayWindowStart(d) };
+      return { ok: false, reason: `daily applicant cap reached (${today.applicants}/${caps.applicants})`, resumeAt: this.nextDayWindowStart(d), scope: 'type' };
     }
     if (type === 'fetch_profile' && today.profiles >= caps.profiles) {
-      return { ok: false, reason: `daily profile cap reached (${today.profiles}/${caps.profiles})`, resumeAt: this.nextDayWindowStart(d) };
+      return { ok: false, reason: `daily profile cap reached (${today.profiles}/${caps.profiles})`, resumeAt: this.nextDayWindowStart(d), scope: 'type' };
     }
     const hour = this.hourCount(d);
     if (hour >= p.hourlyActionCap) {
       const lp = localParts(d, this.tz());
       const nextHour = zonedToUtc(lp.dateKey, `${lp.hour}:00`, this.tz());
       const resume = new Date(nextHour.getTime() + 3_600_000 + randInt(60_000, 300_000, this.rng));
-      return { ok: false, reason: `hourly action cap reached (${hour}/${p.hourlyActionCap})`, resumeAt: resume };
+      return { ok: false, reason: `hourly action cap reached (${hour}/${p.hourlyActionCap})`, resumeAt: resume, scope: 'global' };
     }
     return { ok: true };
   }

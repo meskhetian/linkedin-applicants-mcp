@@ -35,6 +35,30 @@ function makeDeps(runners: Partial<Record<TaskType, TaskRunner>>) {
 }
 
 describe('Worker.runOnce', () => {
+  it('lets profile tasks run when only the applicant cap is reached', async () => {
+    const calls: string[] = [];
+    const { deps, db, pacing } = makeDeps({
+      fetch_application: async () => {
+        calls.push('fetch_application');
+        return 'done';
+      },
+      fetch_profile: async () => {
+        calls.push('fetch_profile');
+        return 'done';
+      },
+    });
+    pacing.dailyApplicantCap = 0; // today's applications are used up
+    db.enqueueTask({ type: 'fetch_application', jobId: 'j', applicationId: 'a', downloadResume: false });
+    db.enqueueTask({ type: 'fetch_profile', jobId: 'j', applicationId: 'a', profileUrl: 'u', depth: 'basic', savePdf: false });
+    const w = new Worker(deps);
+    expect(await w.runOnce()).toBe(true);
+    expect(calls).toEqual(['fetch_profile']);
+    // Only the capped application is left: nothing runs, and the status points at tomorrow.
+    expect(await w.runOnce()).toBe(false);
+    expect(w.status().nextEligibleAt).toBeDefined();
+    expect(db.taskCounts().pending).toBe(1);
+  });
+
   it('runs the highest-priority task, marks it done and records counters', async () => {
     const calls: string[] = [];
     const { deps, db, scheduler } = makeDeps({

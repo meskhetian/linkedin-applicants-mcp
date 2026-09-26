@@ -2,7 +2,7 @@ import path from 'node:path';
 import type { Config } from '../config.js';
 import type { Db } from '../storage/db.js';
 import type { BrowserSession } from '../browser/session.js';
-import type { Scheduler } from './scheduler.js';
+import type { ScheduleDecision, Scheduler } from './scheduler.js';
 import type { Logger, PacingSettings, Task, TaskPayload, TaskType, WorkerStatus } from '../types.js';
 import { createScrapeContext, type ScrapeContext } from '../linkedin/context.js';
 import { syncPostedJobs } from '../linkedin/jobs.js';
@@ -15,6 +15,8 @@ import { applicantDir, writeJson } from '../storage/files.js';
 import { extractResumeText } from '../storage/extract.js';
 import { randInt, sleep as realSleep } from '../browser/humanize.js';
 import { BrowserNotConnectedError, CheckpointError, DeferredError, NotLoggedInError, RateLimitedError, errorMessage, isRetryable } from '../errors.js';
+
+const TASK_TYPES: TaskType[] = ['sync_jobs', 'sync_applicants', 'fetch_application', 'fetch_profile'];
 
 /** Executes one task type against a live ScrapeContext. 'requeued' means the runner already re-scheduled the task. */
 export type TaskRunner = (task: Task, ctx: ScrapeContext, deps: WorkerDeps) => Promise<'done' | 'requeued'>;
@@ -213,11 +215,9 @@ export class Worker {
   /** Run at most one eligible task now. Returns false if nothing ran. */
   async runOnce(): Promise<boolean> {
     if (this.isPaused()) return false;
-    const task = this.deps.db.nextTask(this.deps.getPacing().randomizeOrder);
-    if (!task) return false;
-    const decision = this.deps.scheduler.check(task.type);
-    if (!decision.ok) {
-      this.nextEligibleAt = decision.resumeAt;
+    const { task, deferral } = this.pickTask();
+    if (!task) {
+      if (deferral) this.nextEligibleAt = deferral.resumeAt;
       return false;
     }
     await this.execute(task);
@@ -286,20 +286,19 @@ export class Worker {
           await this.idle(5_000, 15_000);
           continue;
         }
-        const task = db.nextTask(this.deps.getPacing().randomizeOrder);
+        const { task, deferral } = this.pickTask();
         if (!task) {
-          await this.idle(15_000, 45_000);
-          continue;
-        }
-        const decision = scheduler.check(task.type);
-        if (!decision.ok) {
-          this.nextEligibleAt = decision.resumeAt;
-          if (this.lastDeferReason !== decision.reason) {
-            this.lastDeferReason = decision.reason;
-            db.addEvent('info', 'deferred', decision.reason, { resumeAt: decision.resumeAt.toISOString(), taskType: task.type });
-            log.info('deferred by scheduler', { reason: decision.reason, resumeAt: decision.resumeAt.toISOString() });
+          if (!deferral) {
+            await this.idle(15_000, 45_000);
+            continue;
           }
-          const wait = Math.min(Math.max(decision.resumeAt.getTime() - Date.now(), 5_000), 300_000);
+          this.nextEligibleAt = deferral.resumeAt;
+          if (this.lastDeferReason !== deferral.reason) {
+            this.lastDeferReason = deferral.reason;
+            db.addEvent('info', 'deferred', deferral.reason, { resumeAt: deferral.resumeAt.toISOString() });
+            log.info('deferred by scheduler', { reason: deferral.reason, resumeAt: deferral.resumeAt.toISOString() });
+          }
+          const wait = Math.min(Math.max(deferral.resumeAt.getTime() - Date.now(), 5_000), 300_000);
           await this.idle(wait);
           continue;
         }
@@ -312,6 +311,30 @@ export class Worker {
       }
     }
     log.info('worker stopped');
+  }
+
+  /**
+   * Highest-priority runnable task. A task type that hit its daily cap only blocks itself: the other types keep
+   * going (applications capped for today must not starve the profile queue). Global blocks (break, working hours,
+   * hourly cap) stop the search. Returns the earliest deferral when nothing can run.
+   */
+  private pickTask(): { task?: Task; deferral?: Extract<ScheduleDecision, { ok: false }> } {
+    const { db, scheduler } = this.deps;
+    const randomize = this.deps.getPacing().randomizeOrder;
+    const blocked: TaskType[] = [];
+    let deferral: Extract<ScheduleDecision, { ok: false }> | undefined;
+    for (;;) {
+      const allowed = blocked.length ? TASK_TYPES.filter((t) => !blocked.includes(t)) : undefined;
+      if (allowed && !allowed.length) break;
+      const task = db.nextTask(randomize, allowed);
+      if (!task) break;
+      const decision = scheduler.check(task.type);
+      if (decision.ok) return { task, deferral };
+      if (!deferral || decision.resumeAt < deferral.resumeAt) deferral = decision;
+      if (decision.scope !== 'type') break;
+      blocked.push(task.type);
+    }
+    return { deferral };
   }
 
   private async execute(task: Task): Promise<void> {

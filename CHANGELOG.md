@@ -27,6 +27,9 @@ changes; they are called out explicitly.
   clicked.
 - Launch refuses to start when another live process holds the profile's SingletonLock, with a message naming the
   pid, instead of two Chromes closing each other.
+- A task type that reached its daily cap no longer blocks the other types: applications capped for today used to
+  sit at the top of the queue and starve the profile tasks that still had quota. The worker now skips capped types
+  and only idles when nothing at all can run.
 - The passive capture never waits on streaming responses (LinkedIn keeps a realtime event stream open) and bounds
   every body read, so an application fetch cannot stall on the resume step.
 - The session logs when Chrome goes away unexpectedly, and a task whose page vanished during the resume step fails
