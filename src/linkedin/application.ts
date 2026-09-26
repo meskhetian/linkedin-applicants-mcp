@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Download, Locator, Page } from 'patchright';
+import type { Download, Locator, Page, Route } from 'patchright';
 import type { ApplicantRating, ApplicationDetailResult, ScreeningAnswer } from '../types.js';
 import type { ScrapeContext } from './context.js';
 import type { Generation } from './selectors.js';
@@ -366,7 +366,7 @@ async function detectRatingOnPage(page: Page, gen: Generation): Promise<Applican
 interface ResumeOutcome {
   path?: string;
   fileName?: string;
-  strategy: 'attachment' | 'viewer' | 'download' | 'popup' | 'none';
+  strategy: 'attachment' | 'viewer' | 'intercept' | 'download' | 'popup' | 'none';
   hasResume: boolean;
   host?: string;
   /** What the page looked like after the Resume control was used, when no file could be retrieved. */
@@ -405,11 +405,131 @@ interface Saved {
   host?: string;
 }
 
+/** Pure decision for an intercepted response: is this a resume file, and must it be kept away from Chrome's download manager? */
+export function decideResumeIntercept(input: {
+  url: string;
+  resourceType: string;
+  contentType?: string | null;
+  contentDisposition?: string | null;
+  bytes: Buffer;
+  fromWorkingPage: boolean;
+}): { isFile: boolean; swallow: boolean } {
+  const ct = input.contentType ?? '';
+  const cd = input.contentDisposition ?? '';
+  const isFile = !!sniffExt(input.bytes) || /application\/(pdf|msword|vnd\.openxmlformats-officedocument|octet-stream|rtf)/i.test(ct) || /attachment/i.test(cd);
+  // A navigation to a file (same tab or popup) or any attachment would start a Chrome download: answer it ourselves.
+  const swallow = isFile && (input.resourceType === 'document' || /attachment/i.test(cd) || !input.fromWorkingPage);
+  return { isFile, swallow };
+}
+
 /**
- * Layered capture, in order: direct file href on the page → "Download resume" link/menu item → Resume button
- * (which may download directly, open a viewer with an iframe/embed, open the signed URL in a NEW TAB, or expose
- * a Download control). Bytes are fetched immediately (signed URLs are short-lived), first from inside the page
- * (same-origin cookies), then through the browser context's request API (context cookies, any host).
+ * Captures the resume at the network layer so Chrome's download manager never starts. Chrome 154 crashed its
+ * browser process three times in a row the moment an automation-triggered download began, so requests that
+ * look like a resume file (or any navigation inside a popup we opened) are fetched through the browser's own
+ * network stack (route.fetch: same cookies and headers), saved, and then answered with 204 when they would have
+ * become a download, or passed through unchanged when LinkedIn's inline viewer requested them.
+ */
+class ResumeTrap {
+  private saved: Saved | undefined;
+  private resolvers: Array<(s: Saved | undefined) => void> = [];
+  private armed = false;
+  readonly seen: string[] = [];
+
+  constructor(
+    private readonly ctx: ScrapeContext,
+    private readonly saveDir: string,
+  ) {}
+
+  private readonly handler = async (route: Route): Promise<void> => {
+    const req = route.request();
+    const url = req.url();
+    let fromWorkingPage = true;
+    try {
+      fromWorkingPage = req.frame().page() === this.ctx.page;
+    } catch {
+      /* detached frame */
+    }
+    const candidate = looksLikeResumeUrl(url) || (!fromWorkingPage && (req.resourceType() === 'document' || req.isNavigationRequest()));
+    if (!candidate) {
+      await route.continue().catch(() => {});
+      return;
+    }
+    this.seen.push(url.slice(0, 200));
+    try {
+      const resp = await route.fetch({ maxRedirects: 5 });
+      const headers = resp.headers();
+      const body = await resp.body();
+      const { isFile, swallow } = decideResumeIntercept({
+        url,
+        resourceType: req.resourceType(),
+        contentType: headers['content-type'],
+        contentDisposition: headers['content-disposition'],
+        bytes: body,
+        fromWorkingPage,
+      });
+      if (isFile && !this.saved) {
+        const s = saveBytes(body, headers['content-type'], headers['content-disposition'], resp.url(), this.saveDir);
+        if (s) {
+          this.saved = { ...s, host: safeHost(resp.url()) };
+          this.ctx.log.debug('resume captured at the network layer', { url: url.slice(0, 200), bytes: body.length, swallow });
+          this.settle();
+        }
+      }
+      if (swallow) await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } });
+      else await route.fulfill({ response: resp, body });
+    } catch (e) {
+      this.ctx.log.debug('resume intercept failed', { url: url.slice(0, 200), error: errorMessage(e) });
+      // Never let a navigation to a file reach the download manager, even when our own fetch failed.
+      if (req.resourceType() === 'document' && looksLikeResumeUrl(url)) await route.abort('aborted').catch(() => {});
+      else await route.continue().catch(() => {});
+    }
+  };
+
+  async arm(): Promise<void> {
+    if (this.armed) return;
+    this.armed = true;
+    await this.ctx.page.context().route('**/*', this.handler);
+  }
+
+  async disarm(): Promise<void> {
+    if (!this.armed) return;
+    this.armed = false;
+    await this.ctx.page.context().unroute('**/*', this.handler).catch(() => {});
+    this.settle();
+  }
+
+  result(): Saved | undefined {
+    return this.saved;
+  }
+
+  /** Resolves with the captured file, or undefined after `timeoutMs`. */
+  wait(timeoutMs: number): Promise<Saved | undefined> {
+    if (this.saved) return Promise.resolve(this.saved);
+    return new Promise((resolve) => {
+      const done = (s: Saved | undefined) => {
+        clearTimeout(timer);
+        resolve(s);
+      };
+      const timer = setTimeout(() => {
+        this.resolvers = this.resolvers.filter((r) => r !== done);
+        resolve(undefined);
+      }, timeoutMs);
+      this.resolvers.push(done);
+    });
+  }
+
+  private settle(): void {
+    const rs = this.resolvers;
+    this.resolvers = [];
+    for (const r of rs) r(this.saved);
+  }
+}
+
+/**
+ * Layered capture, in order: direct file href on the page → "Download resume" link/menu item → Resume control
+ * (which may open a viewer with an iframe/embed, open the signed URL in a NEW TAB, or expose a Download control).
+ * Every click runs with the network trap armed, so the file is read from the response itself; Chrome's download
+ * manager is never involved (downloads are denied at the context level and cancelled if one still starts).
  */
 async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator | Page, links: Array<{ href: string; text: string }>, saveDir: string): Promise<ResumeOutcome> {
   const { page, human, log } = ctx;
@@ -430,116 +550,137 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
     if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
   }
 
-  // (b) legacy "Download resume" link (direct) or menu item under "More"
-  const dlLink = await firstVisible(root, SEL[gen].detail.downloadResumeLink, { timeoutMs: 600 });
-  if (dlLink) {
-    const href = await attrOf(dlLink, 'href');
-    if (href && looksLikeResumeUrl(href)) {
-      const saved = await fetchResume(ctx, absolutize(href, page.url()), saveDir);
+  const trap = new ResumeTrap(ctx, saveDir);
+  const downloadsSeen: string[] = [];
+  const onDownload = (dl: Download) => {
+    downloadsSeen.push(dl.url().slice(0, 200));
+    log.warn('Chrome started a download despite the network trap; cancelling it', { url: dl.url().slice(0, 200) });
+    dl.cancel().catch(() => {});
+  };
+  await trap.arm();
+  page.on('download', onDownload);
+  try {
+    // (b) legacy "Download resume" link (direct) or menu item under "More"
+    const dlLink = await firstVisible(root, SEL[gen].detail.downloadResumeLink, { timeoutMs: 600 });
+    if (dlLink) {
+      const href = await attrOf(dlLink, 'href');
+      if (href && looksLikeResumeUrl(href)) {
+        const saved = await fetchResume(ctx, absolutize(href, page.url()), saveDir);
+        if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
+      }
+      const got = await clickAndTrap(ctx, dlLink, trap, saveDir, 8000);
+      if (got) return { ...got, hasResume: true };
+    } else {
+      const more = await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 500 });
+      if (more) {
+        await human.click(page, more);
+        await human.pause('short');
+        const item = await firstVisible(page, SEL[gen].detail.downloadResumeLink, { timeoutMs: 1500 });
+        if (item) {
+          const got = await clickAndTrap(ctx, item, trap, saveDir, 8000);
+          if (got) return { ...got, hasResume: true };
+        }
+        await page.keyboard.press('Escape').catch(() => {});
+        await human.pauseMs(300, 800);
+      }
+    }
+
+    // (c) Resume control → popup with the signed URL / viewer / direct file
+    const btn = (await firstVisible(root, SEL[gen].detail.resumeButton, { timeoutMs: 1500 })) ?? (await firstVisible(page, SEL[gen].detail.resumeButton, { timeoutMs: 500 }));
+    if (!btn) {
+      const t = await mainText(page, 20_000);
+      return { strategy: 'none', hasResume: /\bresume\b|\bcv\b/i.test(t) && !/no resume/i.test(t) };
+    }
+    const btnHref = await attrOf(btn, 'href');
+    if (btnHref && looksLikeResumeUrl(btnHref)) {
+      const saved = await fetchResume(ctx, absolutize(btnHref, page.url()), saveDir);
       if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
     }
-    const got = await clickAndCapture(ctx, dlLink, saveDir);
-    if (got) return { ...got, hasResume: true };
-  } else {
-    const more = await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 500 });
-    if (more) {
-      await human.click(page, more);
-      await human.pause('short');
-      const item = await firstVisible(page, SEL[gen].detail.downloadResumeLink, { timeoutMs: 1500 });
-      if (item) {
-        const got = await clickAndCapture(ctx, item, saveDir);
-        if (got) return { ...got, hasResume: true };
+    const direct = await clickAndTrap(ctx, btn, trap, saveDir, 8000);
+    if (direct) return { ...direct, hasResume: true };
+
+    // viewer opened: look for the file inside it
+    let url: string | undefined;
+    for (let i = 0; i < 3 && !url; i++) {
+      const frame = await firstPresent(page, SEL[gen].detail.viewerFrame);
+      url = (await attrOf(frame, 'src')) ?? (await attrOf(frame, 'data')) ?? undefined;
+      if (!url || !looksLikeResumeUrl(url)) {
+        const srcs = await page
+          .evaluate(() =>
+            Array.from(document.querySelectorAll('[role="dialog"] a[href], dialog a[href], .artdeco-modal a[href], iframe[src], embed[src], object[data]')).map(
+              (e) => (e as HTMLAnchorElement).href || e.getAttribute('src') || e.getAttribute('data') || '',
+            ),
+          )
+          .catch(() => [] as string[]);
+        url = srcs.find((s) => looksLikeResumeUrl(s));
       }
-      await page.keyboard.press('Escape').catch(() => {});
-      await human.pauseMs(300, 800);
+      if (!url) await human.pauseMs(800, 1600);
     }
-  }
-
-  // (c) Resume button → direct download / popup / viewer
-  const btn = (await firstVisible(root, SEL[gen].detail.resumeButton, { timeoutMs: 1500 })) ?? (await firstVisible(page, SEL[gen].detail.resumeButton, { timeoutMs: 500 }));
-  if (!btn) {
-    const t = await mainText(page, 20_000);
-    return { strategy: 'none', hasResume: /\bresume\b|\bcv\b/i.test(t) && !/no resume/i.test(t) };
-  }
-  const btnHref = await attrOf(btn, 'href');
-  if (btnHref && looksLikeResumeUrl(btnHref)) {
-    const saved = await fetchResume(ctx, absolutize(btnHref, page.url()), saveDir);
-    if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
-  }
-  const direct = await clickAndCapture(ctx, btn, saveDir, 6000);
-  if (direct) return { ...direct, hasResume: true };
-
-  // viewer opened: look for the file inside it
-  let url: string | undefined;
-  for (let i = 0; i < 3 && !url; i++) {
-    const frame = await firstPresent(page, SEL[gen].detail.viewerFrame);
-    url = (await attrOf(frame, 'src')) ?? (await attrOf(frame, 'data')) ?? undefined;
-    if (!url || !looksLikeResumeUrl(url)) {
-      const srcs = await page
-        .evaluate(() =>
-          Array.from(document.querySelectorAll('[role="dialog"] a[href], dialog a[href], .artdeco-modal a[href], iframe[src], embed[src], object[data]')).map(
-            (e) => (e as HTMLAnchorElement).href || e.getAttribute('src') || e.getAttribute('data') || '',
-          ),
-        )
-        .catch(() => [] as string[]);
-      url = srcs.find((s) => looksLikeResumeUrl(s));
-    }
-    if (!url) await human.pauseMs(800, 1600);
-  }
-  if (url && looksLikeResumeUrl(url)) {
-    const saved = await fetchResume(ctx, absolutize(url, page.url()), saveDir);
-    if (saved) {
+    const trapped = trap.result();
+    if (trapped) {
       await closeViewer();
-      return { ...saved, strategy: 'viewer', hasResume: true };
+      return { ...trapped, strategy: 'intercept', hasResume: true };
     }
-  }
+    if (url && looksLikeResumeUrl(url)) {
+      const saved = await fetchResume(ctx, absolutize(url, page.url()), saveDir);
+      if (saved) {
+        await closeViewer();
+        return { ...saved, strategy: 'viewer', hasResume: true };
+      }
+    }
 
-  // (d) Download control inside the viewer (may download, or open a new tab with the signed URL)
-  const dlBtn = await firstVisible(page, SEL[gen].detail.downloadButton, { timeoutMs: 2000 });
-  if (dlBtn) {
-    const got = await clickAndCapture(ctx, dlBtn, saveDir, 45_000, true);
-    if (got) {
-      await closeViewer();
-      return { ...got, hasResume: true };
+    // (d) Download control inside the viewer
+    const dlBtn = await firstVisible(page, SEL[gen].detail.downloadButton, { timeoutMs: 2000 });
+    if (dlBtn) {
+      const got = await clickAndTrap(ctx, dlBtn, trap, saveDir, 12_000, true);
+      if (got) {
+        await closeViewer();
+        return { ...got, hasResume: true };
+      }
     }
+    const debug = await resumeDebugInfo(ctx, mark);
+    debug.trapSeen = trap.seen.slice(0, 20);
+    debug.downloadsSeen = downloadsSeen;
+    await closeViewer();
+    log.warn('resume control found but no file could be retrieved', { url: page.url(), viewerUrl: url, tabs: debug.tabs, frames: debug.frames, fetched: debug.fetched, trapSeen: debug.trapSeen });
+    return { strategy: 'none', hasResume: true, debug };
+  } finally {
+    page.off('download', onDownload);
+    await trap.disarm();
   }
-  const debug = await resumeDebugInfo(ctx, mark);
-  await closeViewer();
-  log.warn('resume control found but no file could be retrieved', { url: page.url(), viewerUrl: url, tabs: debug.tabs, frames: debug.frames, fetched: debug.fetched });
-  return { strategy: 'none', hasResume: true, debug };
 }
 
 /**
- * Click a control and capture whatever it produces: a same-tab download event, a popup that navigates to the
- * signed file URL (fetched, or its own download event), or nothing (viewer opened → caller inspects the DOM).
+ * Click a control with the network trap armed and collect whatever it produces: a file answered at the network
+ * layer (same tab or popup), or a popup whose URL we can fetch ourselves. Popups are closed only after the trap
+ * has settled, so no download is ever in flight when a tab goes away. Returns undefined when a viewer opened
+ * instead (the caller inspects the DOM).
  */
-async function clickAndCapture(ctx: ScrapeContext, control: Locator, saveDir: string, timeoutMs = 8000, noScroll = false): Promise<(Saved & { strategy: ResumeOutcome['strategy'] }) | undefined> {
+async function clickAndTrap(ctx: ScrapeContext, control: Locator, trap: ResumeTrap, saveDir: string, timeoutMs: number, noScroll = false): Promise<(Saved & { strategy: ResumeOutcome['strategy'] }) | undefined> {
   const { page, human, log } = ctx;
-  const downloadP = page.waitForEvent('download', { timeout: timeoutMs }).catch(() => null);
-  const popupP = page.waitForEvent('popup', { timeout: Math.min(timeoutMs, 8000) }).catch(() => null);
+  const popupP = page.waitForEvent('popup', { timeout: Math.min(timeoutMs, 6000) }).catch(() => null);
   await human.click(page, control, { noScroll });
   await human.pause('short');
+  let saved = await trap.wait(timeoutMs);
   const popup = await popupP;
   if (popup) {
     try {
-      const popupDownload = popup.waitForEvent('download', { timeout: 15_000 }).catch(() => null);
-      await popup.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
-      const url = popup.url();
-      log.debug('resume popup opened', { url: url.slice(0, 200) });
-      if (looksLikeResumeUrl(url) || /ambry|dms|mediaauth|licdn/i.test(url)) {
-        const saved = (await fetchResume(ctx, url, saveDir)) ?? (await fetchResume(ctx, url, saveDir, popup));
-        if (saved) return { ...saved, strategy: 'popup' };
+      if (!saved) {
+        await popup.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => {});
+        const url = popup.url();
+        log.debug('resume popup opened', { url: url.slice(0, 200) });
+        if (looksLikeResumeUrl(url) || /ambry|dms|mediaauth|licdn/i.test(url)) {
+          saved = (await fetchResume(ctx, url, saveDir)) ?? (await fetchResume(ctx, url, saveDir, popup));
+          if (saved) return { ...saved, strategy: 'popup' };
+        }
+        saved = await trap.wait(3000);
       }
-      const dl = await popupDownload;
-      if (dl) return { ...(await saveDownload(dl, saveDir)), strategy: 'popup' };
     } finally {
       await popup.close().catch(() => {});
       await page.bringToFront().catch(() => {});
     }
   }
-  const dl = await downloadP;
-  if (dl) return { ...(await saveDownload(dl, saveDir)), strategy: 'download' };
-  return undefined;
+  return saved ? { ...saved, strategy: 'intercept' } : undefined;
 }
 
 function absolutize(url: string, base: string): string {
@@ -607,21 +748,3 @@ function fileNameFromUrl(url: string): string | undefined {
   }
 }
 
-async function saveDownload(dl: Download, saveDir: string): Promise<Saved> {
-  const suggested = dl.suggestedFilename();
-  let ext = pickResumeExt({ fileName: suggested });
-  let out = path.join(saveDir, `resume.${ext}`);
-  await dl.saveAs(out);
-  try {
-    const real = sniffExt(fs.readFileSync(out).subarray(0, 8));
-    if (real && real !== ext) {
-      const fixed = path.join(saveDir, `resume.${real}`);
-      fs.renameSync(out, fixed);
-      out = fixed;
-      ext = real;
-    }
-  } catch {
-    /* keep as is */
-  }
-  return { path: out, fileName: suggested || undefined, host: safeHost(dl.url()) };
-}

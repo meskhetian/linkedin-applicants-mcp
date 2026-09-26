@@ -48,7 +48,8 @@ export function ensureChromePreferences(profileDir: string, downloadsPath: strin
     }
     const before = JSON.stringify(prefs);
     const plugins = (prefs.plugins as Record<string, unknown> | undefined) ?? {};
-    plugins.always_open_pdf_externally = true;
+    // Let PDFs open in Chrome's viewer instead of turning into downloads; resume files are read at the network layer.
+    plugins.always_open_pdf_externally = false;
     prefs.plugins = plugins;
     const download = (prefs.download as Record<string, unknown> | undefined) ?? {};
     download.prompt_for_download = false;
@@ -63,7 +64,7 @@ export function ensureChromePreferences(profileDir: string, downloadsPath: strin
     const firstRun = path.join(profileDir, 'First Run');
     if (!fs.existsSync(firstRun)) fs.writeFileSync(firstRun, '', 'utf8');
   } catch (e) {
-    log?.warn('could not write Chrome preferences (PDF downloads may open inline)', { error: errorMessage(e) });
+    log?.warn('could not write Chrome preferences', { error: errorMessage(e) });
   }
 }
 
@@ -77,6 +78,7 @@ export class BrowserSession {
   readonly capture: NetworkCapture;
   private browser: Browser | undefined; // cdp mode only
   private context: BrowserContext | undefined;
+  private closing = false;
   private page: Page | undefined;
   private connecting: Promise<Page> | undefined;
 
@@ -131,9 +133,9 @@ export class BrowserSession {
         );
       }
       this.browser = browser;
-      this.context = browser.contexts()[0] ?? (await browser.newContext({ acceptDownloads: true }));
-      browser.once('disconnected', () => this.reset());
-      this.context.once('close', () => this.reset());
+      this.context = browser.contexts()[0] ?? (await browser.newContext({ acceptDownloads: false }));
+      browser.once('disconnected', () => this.onContextGone('cdp disconnected'));
+      this.context.once('close', () => this.onContextGone('context closed'));
       return;
     }
 
@@ -147,8 +149,9 @@ export class BrowserSession {
         channel: cfg.chromeChannel,
         headless: false, // never headless: a visible window is part of looking like a person
         viewport: null, // use the real window size
-        acceptDownloads: true,
-        downloadsPath,
+        // Chrome 154 crashed its browser process whenever an automation-triggered download started, so downloads
+        // are denied here and resume files are read from the network response instead (see ResumeTrap).
+        acceptDownloads: false,
         // Playwright passes --no-sandbox unless the sandbox is explicitly enabled; Chrome then shows a yellow
         // "unsupported command-line flag" bar. Keep the real sandbox on: normal Chrome, no warning bar.
         chromiumSandbox: true,
@@ -164,7 +167,12 @@ export class BrowserSession {
         `Could not launch ${cfg.chromeChannel} with profile ${cfg.profileDir}. If a Chrome window is already using this profile, close it first (or set LINKEDIN_MCP_BROWSER_MODE=cdp and use scripts/launch-chrome.sh). Original error: ${msg}`,
       );
     }
-    this.context.once('close', () => this.reset());
+    this.context.once('close', () => this.onContextGone('context closed'));
+  }
+
+  private onContextGone(how: string): void {
+    if (!this.closing) this.deps.log.warn('Chrome went away unexpectedly (crash or closed by hand); it will be relaunched on demand', { how });
+    this.reset();
   }
 
   private reset(): void {
@@ -239,6 +247,7 @@ export class BrowserSession {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     try {
       if (this.deps.cfg.browserMode === 'cdp') {
         // Playwright: for a browser obtained via connectOverCDP, close() "clears all created contexts belonging to this
@@ -249,6 +258,7 @@ export class BrowserSession {
       }
     } finally {
       this.reset();
+      this.closing = false;
     }
   }
 }

@@ -10,6 +10,13 @@ changes; they are called out explicitly.
 
 ### Fixed
 
+- **Chrome no longer crashes when a resume is opened.** Google Chrome 154 crashed its browser process
+  ("Google Chrome quit unexpectedly") the moment an automation-triggered download started. Resume files are now
+  read at the network layer: the request LinkedIn makes for the file is fetched through the browser's own network
+  stack, saved, and answered with an empty 204 so the download manager never starts. Downloads are denied at the
+  context level, a stray download is cancelled, PDFs stay in Chrome's viewer, and if Chrome is still lost during
+  an application fetch the retry captures the details without the resume and records why.
+- The session logs when Chrome goes away unexpectedly and relaunches it on demand.
 - Hiring Pro application details: the detail pane is now isolated as the whole block from the applicant header
   down to "View full profile" instead of the header card alone, so the Contact button, the Qualifications section
   and the experience summary are read. Contact popovers without ARIA roles are captured by diffing the page text,

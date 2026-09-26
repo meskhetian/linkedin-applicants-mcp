@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractQualificationsText, filenameFromContentDisposition, parseDetailHeaderText, parseScreeningText, pickResumeExt, sliceBetween, sniffExt } from '../src/linkedin/application.js';
+import { decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, parseDetailHeaderText, parseScreeningText, pickResumeExt, sliceBetween, sniffExt } from '../src/linkedin/application.js';
 
 describe('filenameFromContentDisposition', () => {
   it('handles plain, quoted and RFC 5987 forms', () => {
@@ -65,5 +65,30 @@ describe('extractQualificationsText (Hiring Pro pane)', () => {
   it('is undefined when the pane has no such section', () => {
     expect(extractQualificationsText('Dana Whitfield\nApplied 3d ago\nResume')).toBeUndefined();
     expect(sliceBetween('a\nb\nc', /^b$/, /^zzz$/)).toBe('b\nc');
+  });
+});
+
+describe('decideResumeIntercept (network-layer resume capture)', () => {
+  const pdf = Buffer.from('%PDF-1.7\n%\u00e2\u00e3\u00cf\u00d3\n1 0 obj', 'latin1');
+  const html = Buffer.from('<!doctype html><html><body>viewer</body></html>');
+
+  it('swallows a navigation to a PDF so Chrome never starts a download', () => {
+    expect(decideResumeIntercept({ url: 'https://media.licdn.com/dms/document/x.pdf', resourceType: 'document', contentType: 'application/pdf', bytes: pdf, fromWorkingPage: true })).toEqual({ isFile: true, swallow: true });
+  });
+
+  it('swallows attachments regardless of resource type', () => {
+    expect(decideResumeIntercept({ url: 'https://www.linkedin.com/ambry/?x-li-ambry-ep=abc', resourceType: 'xhr', contentType: 'application/octet-stream', contentDisposition: 'attachment; filename="cv.docx"', bytes: Buffer.alloc(300), fromWorkingPage: true })).toEqual({ isFile: true, swallow: true });
+  });
+
+  it('passes an inline viewer fetch through while still recognising the file', () => {
+    expect(decideResumeIntercept({ url: 'https://media.licdn.com/dms/document/x', resourceType: 'fetch', contentType: 'application/pdf', bytes: pdf, fromWorkingPage: true })).toEqual({ isFile: true, swallow: false });
+  });
+
+  it('swallows any file that lands in a popup we opened', () => {
+    expect(decideResumeIntercept({ url: 'https://example.cdn/some/signed/url', resourceType: 'fetch', contentType: 'application/pdf', bytes: pdf, fromWorkingPage: false })).toEqual({ isFile: true, swallow: true });
+  });
+
+  it('leaves HTML alone', () => {
+    expect(decideResumeIntercept({ url: 'https://www.linkedin.com/hiring/applicants/', resourceType: 'document', contentType: 'text/html; charset=utf-8', bytes: html, fromWorkingPage: false })).toEqual({ isFile: false, swallow: false });
   });
 });

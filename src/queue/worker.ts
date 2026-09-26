@@ -8,6 +8,7 @@ import { createScrapeContext, type ScrapeContext } from '../linkedin/context.js'
 import { syncPostedJobs } from '../linkedin/jobs.js';
 import { syncApplicantList } from '../linkedin/applicants.js';
 import { fetchApplicationDetail } from '../linkedin/application.js';
+import { shouldSkipResumeDownload } from './resume-policy.js';
 import { fetchProfile, profileToText } from '../linkedin/profile.js';
 import { URLS } from '../linkedin/urls.js';
 import { applicantDir, writeJson } from '../storage/files.js';
@@ -83,7 +84,12 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
       const p = task.payload as PayloadOf<'fetch_application'>;
       const existing = deps.db.getApplicant(p.applicationId);
       const dir = applicantDir(deps.cfg, p.jobId, p.applicationId, existing?.fullName);
-      const r = await fetchApplicationDetail(ctx, p.jobId, p.applicationId, { downloadResume: p.downloadResume, saveDir: dir });
+      const skipResume = shouldSkipResumeDownload(task, p.downloadResume);
+      if (skipResume) {
+        deps.log.warn('the browser was lost during the previous attempt of this application; fetching details without the resume this time', { applicationId: p.applicationId, lastError: task.lastError });
+        deps.db.addEvent('warn', 'resume-skipped', `Resume download skipped for application ${p.applicationId} after Chrome closed during the previous attempt; run applicants_fetch_details later to retry it.`, { taskId: task.id });
+      }
+      const r = await fetchApplicationDetail(ctx, p.jobId, p.applicationId, { downloadResume: p.downloadResume && !skipResume, saveDir: dir });
       const resumeText = r.resumePath ? await extractResumeText(r.resumePath) : undefined;
       if (!existing) {
         deps.db.upsertApplicantFromList({ applicationId: p.applicationId, jobId: p.jobId, fullName: r.fullName ?? `Applicant ${p.applicationId}`, listSyncedAt: new Date().toISOString() });
@@ -103,7 +109,7 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
         resumePath: r.resumePath,
         resumeFileName: r.resumeFileName,
         resumeText: resumeText || undefined,
-        raw: r.extra,
+        raw: skipResume ? { ...r.extra, resumeSkipped: 'browser closed during the previous attempt' } : r.extra,
       });
       if (r.resumePath && !resumeText) deps.log.warn('resume saved but no text could be extracted (scanned PDF?)', { applicationId: p.applicationId, path: r.resumePath });
       const profileUrl = r.profileUrl ?? existing?.profileUrl;
