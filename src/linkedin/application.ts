@@ -510,6 +510,34 @@ export function classifyTrapRequest(input: { url: string; isTopLevelNavigation: 
   return { swallow: input.origin === 'popup' && !isLinkedInPageUrl(input.url) };
 }
 
+/** Long-lived or streaming responses (LinkedIn's realtime event stream, tracking beacons) must never be awaited. */
+export function shouldReadResponseBody(input: { resourceType: string; contentType: string | undefined; url: string }): 'text' | 'file' | 'skip' {
+  const ct = (input.contentType ?? '').toLowerCase();
+  if (/event-stream|multipart|octet-stream-chunked/.test(ct)) return 'skip';
+  if (/\/realtime\/|\/li\/track|platform-telemetry|\/sensorCollect|\/csp-report|\/log\b/i.test(input.url)) return 'skip';
+  const type = input.resourceType;
+  if ((type === 'fetch' || type === 'xhr' || type === 'document') && /linkedin\.com\//i.test(input.url) && /json|x-component|text\/html|text\/plain|javascript/.test(ct)) return 'text';
+  if (type !== 'document' && (DOCUMENT_CT_RE.test(ct) || looksLikeResumeUrl(input.url))) return 'file';
+  return 'skip';
+}
+
+/** Resolve to `fallback` when `p` takes longer than `ms` (the promise itself keeps running in the background). */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(t);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
 /**
  * Passive network capture around a Resume click, so Chrome's download manager never starts. Chrome 154 crashed
  * its browser process three times in a row the moment an automation-triggered download began (first as a real
@@ -576,22 +604,24 @@ class ResumeTrap {
   private readonly onResponse = (resp: Response): void => {
     const req = resp.request();
     if (this.originOf(req) === 'other') return;
-    const type = req.resourceType();
-    const ct = resp.headers()['content-type'] ?? '';
+    const ct = resp.headers()['content-type'];
     const url = resp.url();
+    const kind = shouldReadResponseBody({ resourceType: req.resourceType(), contentType: ct, url });
+    if (kind === 'skip') return;
     const job = (async () => {
-      if ((type === 'fetch' || type === 'xhr' || type === 'document') && /linkedin\.com\//i.test(url) && /json|x-component|javascript|html|text/i.test(ct)) {
-        const text = await resp.text().catch(() => '');
+      if (kind === 'text') {
+        // Bounded: a body that has not arrived within a few seconds is a stream or a stall, never the viewer payload.
+        const text = await withTimeout(resp.text(), 5000, '');
         if (text && text.length < 4_000_000) {
           let added = false;
           for (const u of findDocumentUrls(text)) if (!this.documentUrls.has(u)) (this.documentUrls.add(u), (added = true));
           if (added) this.settle();
         }
-      } else if (!this.saved && type !== 'document' && (DOCUMENT_CT_RE.test(ct) || looksLikeResumeUrl(url))) {
+      } else if (!this.saved) {
         // The viewer fetched the file itself: Chrome made the request, we only read the bytes.
-        const body = await resp.body().catch(() => undefined);
+        const body = await withTimeout<Buffer | undefined>(resp.body(), 15_000, undefined);
         if (body && !looksTextual(body)) {
-          const s = saveBytes(body, ct, resp.headers()['content-disposition'], url, this.saveDir);
+          const s = saveBytes(body, ct ?? null, resp.headers()['content-disposition'], url, this.saveDir);
           if (s) {
             this.saved = { ...s, host: safeHost(url), url };
             this.ctx.log.debug('resume read from the viewer response', { url: redactUrl(url), bytes: body.length });
@@ -620,7 +650,8 @@ class ResumeTrap {
     this.ctx.page.off('popup', this.onPopup);
     context.off('response', this.onResponse);
     await context.unroute('**/*', this.onRoute).catch(() => {});
-    await Promise.allSettled([...this.pending]);
+    // Body reads are bounded themselves; never let a straggler hold the task.
+    await withTimeout(Promise.allSettled([...this.pending]), 3000, []);
     this.settle();
   }
 

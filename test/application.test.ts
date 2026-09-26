@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyTrapRequest, decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, redactUrl, scoreDocumentUrl, sliceBetween, sniffExt } from '../src/linkedin/application.js';
+import { classifyTrapRequest, decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, redactUrl, scoreDocumentUrl, shouldReadResponseBody, sliceBetween, sniffExt } from '../src/linkedin/application.js';
 
 describe('filenameFromContentDisposition', () => {
   it('handles plain, quoted and RFC 5987 forms', () => {
@@ -151,5 +151,21 @@ describe('decideResumeIntercept uses the url for unknown binary navigations', ()
     const base = { resourceType: 'document', contentType: null, bytes: binary, fromWorkingPage: true };
     expect(decideResumeIntercept({ ...base, url: 'https://www.linkedin.com/dms/prv/document/media/v2/x/recruiter-candidate-document-pdf-analyzed/y' }).isFile).toBe(true);
     expect(decideResumeIntercept({ ...base, url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1' }).isFile).toBe(false);
+  });
+});
+
+describe('shouldReadResponseBody', () => {
+  it('never awaits streams or telemetry', () => {
+    expect(shouldReadResponseBody({ resourceType: 'fetch', contentType: 'text/event-stream', url: 'https://www.linkedin.com/realtime/connect' })).toBe('skip');
+    expect(shouldReadResponseBody({ resourceType: 'fetch', contentType: 'application/json', url: 'https://www.linkedin.com/realtime/realtimeFrontendClientConnectivityTracking' })).toBe('skip');
+    expect(shouldReadResponseBody({ resourceType: 'fetch', contentType: 'application/json', url: 'https://www.linkedin.com/li/track' })).toBe('skip');
+  });
+
+  it('reads viewer payloads as text and viewer file fetches as files', () => {
+    expect(shouldReadResponseBody({ resourceType: 'fetch', contentType: 'text/x-component', url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1' })).toBe('text');
+    expect(shouldReadResponseBody({ resourceType: 'xhr', contentType: 'application/pdf', url: 'https://www.linkedin.com/dms/prv/document/media/v2/x/recruiter-candidate-document-pdf-analyzed/y' })).toBe('file');
+    expect(shouldReadResponseBody({ resourceType: 'document', contentType: 'application/pdf', url: 'https://media.licdn.com/dms/document/x.pdf' })).toBe('skip');
+    expect(shouldReadResponseBody({ resourceType: 'image', contentType: 'image/png', url: 'https://media.licdn.com/dms/image/v2/x/profile-displayphoto-shrink_100_100/y' })).toBe('skip');
+    expect(shouldReadResponseBody({ resourceType: 'script', contentType: 'application/javascript', url: 'https://static.licdn.com/sc/h/app.js' })).toBe('skip');
   });
 });

@@ -28,6 +28,8 @@ changes; they are called out explicitly.
   clicked.
 - Launch refuses to start when another live process holds the profile's SingletonLock, with a message naming the
   pid, instead of two Chromes closing each other.
+- The passive capture never waits on streaming responses (LinkedIn keeps a realtime event stream open) and bounds
+  every body read, so an application fetch cannot stall on the resume step.
 - The session logs when Chrome goes away unexpectedly, and a task whose page vanished during the resume step fails
   instead of finishing without a resume, so the retry policy can react.
 - Log lines carry host and path of resume URLs only; signed tokens stay in the raw capture next to the file.
