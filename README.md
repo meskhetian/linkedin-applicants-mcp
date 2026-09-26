@@ -276,7 +276,7 @@ Steps 2–5 only enqueue work; the worker does the browsing during working hours
 | Tool | Description |
 | --- | --- |
 | `applicants_sync` | Crawl the applicant **list** of one job or `allJobs`: name, headline, location, applied date, application id, profile link. Runs in chunks of `pagesPerRun`, resumes across restarts; `restart` ignores saved progress. |
-| `applicants_fetch_details` | Open each application page (email/phone when shared, screening answers, rating), download the resume, then optionally the full profile (`includeProfile`, `profileDepth`, `savePdf`). `onlyMissing` and `limit` control scope. |
+| `applicants_fetch_details` | Open each application page (email/phone when shared, screening answers, rating), capture the resume, then optionally the full profile (`includeProfile`, `profileDepth`). `onlyMissing` and `limit` control scope. Best-matching applicants go first (`orderByFit`, from LinkedIn's must-have counters), and `profileMinMustHave` limits profile visits to strong matches so a long queue spends its daily budget where it matters. |
 | `applicants_fetch_profiles` | Full profiles only, for applicants whose profile URL is already known. The most rate-sensitive action on LinkedIn. |
 
 ### Data (local, instant)

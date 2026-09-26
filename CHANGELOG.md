@@ -54,6 +54,10 @@ changes; they are called out explicitly.
 
 ### Added
 
+- `applicants_fetch_details` fetches the applicants who match the job's must-have qualifications best first
+  (`orderByFit`, on by default, from the counters LinkedIn shows on the list card), and `profileMinMustHave` limits
+  profile visits to strong matches so a long queue spends its daily budget where it matters. The others still get
+  details and resume; their profiles can be queued later with `applicants_fetch_profiles`.
 - `npm run reparse [jobId]` re-runs the current parsers over the raw card text kept with every stored row,
   without touching LinkedIn.
 

@@ -180,6 +180,40 @@ export function parseProRowText(text: string): ParsedProRow {
   return { fullName, title, company, location, appliedOn: appliedLine, qualificationsText, meetsScreening: meets, isNew, openToWork };
 }
 
+/** Must-have and preferred qualification counters as LinkedIn shows them on the list card ("4/6 · Must-have · 5/5 · Preferred"). */
+export interface FitScore {
+  /** Fraction of must-have qualifications met, 0..1. */
+  mustHave: number;
+  /** Fraction of preferred qualifications met, 0..1 (0 when LinkedIn shows none). */
+  preferred: number;
+  mustHaveText?: string;
+  preferredText?: string;
+}
+
+export function parseFitScore(qualifications: string | undefined | null): FitScore | undefined {
+  if (!qualifications) return undefined;
+  const m = /(\d+)\s*\/\s*(\d+)\s*[·•]?\s*must-have/i.exec(qualifications);
+  if (!m || Number(m[2]) === 0) return undefined;
+  const pref = /(\d+)\s*\/\s*(\d+)\s*[·•]?\s*preferred/i.exec(qualifications);
+  return {
+    mustHave: Number(m[1]) / Number(m[2]),
+    preferred: pref && Number(pref[2]) ? Number(pref[1]) / Number(pref[2]) : 0,
+    mustHaveText: `${m[1]}/${m[2]}`,
+    preferredText: pref ? `${pref[1]}/${pref[2]}` : undefined,
+  };
+}
+
+/**
+ * Queue priority bonus so the applicants who match the job best are fetched first: all must-haves +30, 80% +20,
+ * two thirds +10, half +5, then up to +4 for preferred qualifications. Unknown fit gets no bonus.
+ */
+export function fitPriorityBonus(fit: FitScore | undefined): number {
+  if (!fit) return 0;
+  const m = fit.mustHave;
+  const base = m >= 1 ? 30 : m >= 0.8 ? 20 : m >= 0.66 ? 10 : m >= 0.5 ? 5 : 0;
+  return base + Math.round(fit.preferred * 4);
+}
+
 /** "Applied on: Sep 20, 2026" | "Applied 3 days ago" | "2 weeks ago" → ISO */
 export function parseAppliedOn(text: string | undefined, now: Date = new Date()): string | undefined {
   if (!text) return undefined;

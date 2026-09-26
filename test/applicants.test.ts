@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideNextPage, parseAppliedOn, parseApplicantCardText, parseNameBadges, parseProRowText } from '../src/linkedin/applicants.js';
+import { decideNextPage, fitPriorityBonus, parseApplicantCardText, parseAppliedOn, parseFitScore, parseNameBadges, parseProRowText } from '../src/linkedin/applicants.js';
 
 describe('parseApplicantCardText (legacy)', () => {
   it('parses a legacy-style card', () => {
@@ -144,5 +144,25 @@ describe('parseProRowText (list card as rendered 2026-09)', () => {
     const q = parseProRowText('Priya Raman\n\n· 2nd\n\nDirector, Strategy & Operations\n\nAustin, Texas, United States\n\n5/6\n\nMust-have\n\n5/5\n\nPreferred');
     expect(q.location).toBe('Austin, Texas, United States');
     expect(q.meetsScreening).toBe(false);
+  });
+});
+
+describe('fit score from the list counters', () => {
+  it('parses must-have and preferred fractions', () => {
+    expect(parseFitScore('6/6 · Must-have · 5/5 · Preferred')).toMatchObject({ mustHave: 1, preferred: 1, mustHaveText: '6/6', preferredText: '5/5' });
+    expect(parseFitScore('3/6 · Must-have · 2/5 · Preferred')).toMatchObject({ mustHave: 0.5, preferred: 0.4 });
+    expect(parseFitScore('4/6 Must-have')).toMatchObject({ mustHave: 4 / 6, preferred: 0 });
+    expect(parseFitScore(undefined)).toBeUndefined();
+    expect(parseFitScore('Top fit')).toBeUndefined();
+  });
+
+  it('ranks full matches first and unknown fit last', () => {
+    const b = (q: string | undefined) => fitPriorityBonus(parseFitScore(q));
+    expect(b('6/6 · Must-have · 5/5 · Preferred')).toBe(34);
+    expect(b('5/6 · Must-have · 5/5 · Preferred')).toBe(24);
+    expect(b('4/6 · Must-have · 5/5 · Preferred')).toBe(14);
+    expect(b('3/6 · Must-have · 0/5 · Preferred')).toBe(5);
+    expect(b('1/6 · Must-have · 5/5 · Preferred')).toBe(4);
+    expect(b(undefined)).toBe(0);
   });
 });

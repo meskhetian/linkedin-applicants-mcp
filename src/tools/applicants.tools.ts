@@ -3,16 +3,17 @@ import { z } from 'zod';
 import type { Deps } from '../deps.js';
 import type { ProfileDepth, TaskPayload } from '../types.js';
 import { fail, guard, ok } from './result.js';
+import { fitPriorityBonus, parseFitScore } from '../linkedin/applicants.js';
 
 const DEPTH = z.enum(['basic', 'full']);
 
-function enqueueAll(deps: Deps, payloads: TaskPayload[]): { enqueued: number; deduped: number; taskIds: number[] } {
+function enqueueAll(deps: Deps, payloads: Array<TaskPayload & { priority?: number }>): { enqueued: number; deduped: number; taskIds: number[] } {
   let enqueued = 0;
   let deduped = 0;
   const taskIds: number[] = [];
   deps.db.transaction(() => {
-    for (const p of payloads) {
-      const id = deps.db.enqueueTask(p);
+    for (const { priority, ...p } of payloads) {
+      const id = deps.db.enqueueTask(p as TaskPayload, priority === undefined ? {} : { priority });
       if (id === undefined) deduped++;
       else {
         enqueued++;
@@ -77,10 +78,17 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
         savePdf: z.boolean().default(false).describe('Reserved: LinkedIn "Save to PDF" is a Chrome download, which crashes Chrome 154 under automation, so it is currently skipped with a warning; the structured profile is stored instead'),
         onlyMissing: z.boolean().default(true).describe('Skip applicants whose details were already fetched (with downloadResume, applicants whose resume is still missing are included)'),
         limit: z.number().int().min(1).max(10000).optional().describe('Queue at most this many applicants now'),
+        orderByFit: z.boolean().default(true).describe("Fetch the applicants who match the job's must-have qualifications best first (LinkedIn's list counters), so the strong candidates are done in the first days of a long queue"),
+        profileMinMustHave: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe('With includeProfile: only visit the LinkedIn profile of applicants meeting at least this fraction of the must-have qualifications (for example 0.8). Others get details and resume only; queue their profiles later with applicants_fetch_profiles'),
       },
       annotations: { readOnlyHint: false, openWorldHint: true, idempotentHint: true },
     },
-    guard(async ({ jobId, applicationIds, downloadResume, includeProfile, profileDepth, savePdf, onlyMissing, limit }) => {
+    guard(async ({ jobId, applicationIds, downloadResume, includeProfile, profileDepth, savePdf, onlyMissing, limit, orderByFit, profileMinMustHave }) => {
       let targets: Array<{ applicationId: string; jobId: string }> = [];
       if (applicationIds?.length) {
         for (const id of applicationIds) {
@@ -104,10 +112,22 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
       }
       if (limit) targets = targets.slice(0, limit);
       const thenProfile = includeProfile ? { depth: profileDepth as ProfileDepth, savePdf } : undefined;
-      const result = enqueueAll(
-        deps,
-        targets.map((t) => ({ type: 'fetch_application', jobId: t.jobId, applicationId: t.applicationId, downloadResume, thenProfile })),
-      );
+      let profilesSkipped = 0;
+      const payloads = targets.map((t) => {
+        const raw = (deps.db.getApplicant(t.applicationId)?.raw ?? {}) as { qualifications?: string };
+        const fit = orderByFit || profileMinMustHave !== undefined ? parseFitScore(raw.qualifications) : undefined;
+        const wantProfile = thenProfile && (profileMinMustHave === undefined || (fit?.mustHave ?? 0) >= profileMinMustHave);
+        if (thenProfile && !wantProfile) profilesSkipped++;
+        return {
+          type: 'fetch_application' as const,
+          jobId: t.jobId,
+          applicationId: t.applicationId,
+          downloadResume,
+          thenProfile: wantProfile ? thenProfile : undefined,
+          priority: orderByFit ? 50 + fitPriorityBonus(fit) : undefined,
+        };
+      });
+      const result = enqueueAll(deps, payloads);
       deps.worker.start();
       const caps = deps.scheduler.effectiveCaps();
       const pending = deps.db.pendingByType();
@@ -116,6 +136,7 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
       return ok({
         ...result,
         targeted: targets.length,
+        profilesSkippedByFit: profilesSkipped,
         queueNow: pending,
         effectiveDailyCaps: caps,
         estimate: {
