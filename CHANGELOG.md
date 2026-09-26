@@ -54,6 +54,8 @@ changes; they are called out explicitly.
 
 ### Added
 
+- README: what LinkedIn actually limits (documented versus folklore), a concrete pacing plan for a job with about
+  1,000 applicants, and the warning signs with the response to each.
 - `applicants_fetch_details` fetches the applicants who match the job's must-have qualifications best first
   (`orderByFit`, on by default, from the counters LinkedIn shows on the list card), and `profileMinMustHave` limits
   profile visits to strong matches so a long queue spends its daily budget where it matters. The others still get

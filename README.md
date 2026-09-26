@@ -329,7 +329,7 @@ Everything below is the `normal` speed. Slower is safer; the defaults mimic one 
 | Daily cap: application pages | 120, **ramped**: 25 on day 1, +10 per day until the cap | `dailyApplicantCap`, `rampStart`, `rampPerDay` |
 | Daily cap: full profile views | 80, ramped at 70 % of the applicant ramp | `dailyProfileCap` |
 | Hourly cap: LinkedIn page actions | 40 per rolling hour | `hourlyActionCap` |
-| Long breaks | every 25–60 actions, 5–20 minutes |, |
+| Long breaks | every 25–60 actions, 5–20 minutes | `breakEveryActions`, `breakMinutes` |
 | Order | same-priority tasks shuffled; 8 % chance of a warm-up visit to the feed | `randomizeOrder`, `warmupProbability` |
 | LinkedIn "Save to PDF" | at most 150 profiles per month (LinkedIn's own limit is 200) | `LINKEDIN_MCP_SAVE_PDF_MONTHLY_CAP` |
 
@@ -346,6 +346,18 @@ The `speed` preset scales the three caps (`slow` × 0.6, `brisk` × 1.4) and pic
 **Expected throughput** at `normal`, once ramped: roughly 80–120 application pages and 60–80 profiles per work day. A job with 2,000 applicants is ~80 list pages (a few hours inside working hours), then ~17 work days of application pages and ~25 work days of profiles running interleaved, about five work weeks plus the ramp. If you need it faster, add work days or hours before raising caps, and never raise `dailyProfileCap` much above 100.
 
 **Start slow after a new-device login.** The first sign-in to the dedicated profile looks like a new device to LinkedIn (expect an email PIN). Do not start a crawl the same evening. Begin the next work day with `jobs_sync` and a small `applicants_sync`, consider `LINKEDIN_MCP_SPEED=slow` with a gentler ramp (for example `LINKEDIN_MCP_RAMP_START=15`, `LINKEDIN_MCP_RAMP_PER_DAY=8`) for the first week, and only then move to `normal`.
+
+**What LinkedIn actually limits.** Its help pages document no cap on opening applications in your own hiring dashboard. What is limited is viewing profiles of people you are not connected to: a daily "data security" limit (undisclosed, temporary block on non-connection profile views) and the monthly commercial use limit on people search and non-connection browsing (undisclosed, resets on the 1st). Detection is behavioural: round-the-clock activity, uniform intervals and request sequences that do not look like a person reading, more than raw daily counts. Community numbers ("80 profile views a day", "300 searches a month") are guesses; treat 40 to 60 non-connection profile views per working day as the conservative band.
+
+**A plan for a job with about 1,000 applicants** (roughly 11 days instead of three weeks, while still looking like one busy recruiter):
+
+- Work 08:30 to 18:30 local time, seven days or six; never around the clock. A recruiter reading resumes at 03:00 is exactly the outlier the model catches.
+- Applications: 40 the first day, then +15 per day up to 120 (`pacing_set` with `rampStart`, `rampPerDay`, `dailyApplicantCap`), `hourlyActionCap` 30, the built-in breaks, `warmupProbability` 0.15 so feed visits break the cycle.
+- Profiles: `dailyProfileCap` 50, and only for applicants who meet the must-have qualifications (`applicants_fetch_details` with `profileMinMustHave`, for example 0.8). Contact details are on the application when the applicant shared them and almost always in the resume text, so most profiles are not needed for an export.
+- Same machine, same home network, no VPN, no other LinkedIn extensions in the dedicated profile, no second-device logins while the queue runs. After a new-device login, keep the ramp.
+- Closed jobs: fetch details for the best matches first (`orderByFit`, `limit`), review the export, then decide whether the long tail is worth opening at all.
+
+**Warning signs and what to do.** "We noticed unusual activity" (not restricted yet): stop for the day and halve every cap for a week. "Your ability to view profiles has been temporarily restricted" or a commercial use warning: `includeProfile: false` until the stated date, dashboard reads at half volume, then profiles at 25 per day. A CAPTCHA, a sign-in PIN or `needsHuman` in `queue_status`: solve it by hand in the Chrome window, pause a day or two, resume at half caps; two in a week means stop for the month. A formal restriction notice: stop the tool and wait out the stated date; second offences are where permanent restrictions are reported.
 
 **Profile strategy.** Profile views are the most rate-sensitive action on LinkedIn. With `LINKEDIN_MCP_PROFILE_STRATEGY=auto` (default) the worker visits the profile page like a person and then makes one request (1–3 with top-ups for truncated sections) to LinkedIn's internal profile API from inside the page, structured data with dates, instead of ~8 page views through the detail sections, and falls back to the rendered text if that fails. `dom` never touches the API and reads the profile and detail pages as text, at the cost of more page views per applicant. `voyager` uses the API only and fails if LinkedIn retires the endpoint.
 
