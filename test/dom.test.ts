@@ -33,3 +33,16 @@ describe('relativeToIso short forms', () => {
     expect(relativeToIso('12m ago', now)).toBe('2026-09-25T11:48:00.000Z');
   });
 });
+
+describe('extractPhone ignores years and counters', () => {
+  it('does not mistake experience year ranges or qualification counters for phone numbers', () => {
+    expect(extractPhone('Chief Operating Officer\nAcme Robotics • 2021-Present\nMBA • 2009-2011\n6/6\nMust-have')).toBeUndefined();
+    expect(extractPhone('2016-2018 2015-2017 2011-2015')).toBeUndefined();
+    expect(extractPhone('Applied 1w ago 39209368212')).toBeUndefined();
+  });
+
+  it('still finds real numbers', () => {
+    expect(extractPhone('Mobile: +1 415 555 0134')).toBe('+1 415 555 0134');
+    expect(extractPhone('Phone (312) 555-0199 shared')).toBe('(312) 555-0199');
+  });
+});

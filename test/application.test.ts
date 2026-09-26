@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, parseDetailHeaderText, parseScreeningText, pickResumeExt, sliceBetween, sniffExt } from '../src/linkedin/application.js';
+import { decideResumeIntercept, extractQualificationsText, filenameFromContentDisposition, findDocumentUrls, looksTextual, parseDetailHeaderText, parseScreeningText, pickResumeExt, sliceBetween, sniffExt } from '../src/linkedin/application.js';
 
 describe('filenameFromContentDisposition', () => {
   it('handles plain, quoted and RFC 5987 forms', () => {
@@ -90,5 +90,30 @@ describe('decideResumeIntercept (network-layer resume capture)', () => {
 
   it('leaves HTML alone', () => {
     expect(decideResumeIntercept({ url: 'https://www.linkedin.com/hiring/applicants/', resourceType: 'document', contentType: 'text/html; charset=utf-8', bytes: html, fromWorkingPage: false })).toEqual({ isFile: false, swallow: false });
+  });
+});
+
+describe('viewer payloads are text, not resumes', () => {
+  const rsc = Buffer.from('1:I["2ad3ea7278caf3e388ff36e545132f6c",[],"DestinationReporter"]\n2:I["9572b44cf39ab2b79fb58e1626297543",[],"PageLoadTracingProvider"]\n0:["$","div",null,{"data-sdui-screen":"com.linkedin.sdui.flagshipnav.hiring.appeval.ResumeViewer"}]');
+
+  it('looksTextual tells text from documents', () => {
+    expect(looksTextual(rsc)).toBe(true);
+    expect(looksTextual(Buffer.from('{"data":1}'))).toBe(true);
+    expect(looksTextual(Buffer.from('%PDF-1.7\n%\u00e2\u00e3', 'latin1'))).toBe(false);
+    expect(looksTextual(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]))).toBe(false);
+  });
+
+  it('decideResumeIntercept never treats a viewer payload as a file, whatever the headers say', () => {
+    expect(decideResumeIntercept({ url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1', resourceType: 'fetch', contentType: 'application/octet-stream', bytes: rsc, fromWorkingPage: true }).isFile).toBe(false);
+    expect(decideResumeIntercept({ url: 'https://www.linkedin.com/hiring/applicants/?applicationId=1', resourceType: 'fetch', contentType: 'text/x-component', contentDisposition: 'attachment', bytes: rsc, fromWorkingPage: false }).isFile).toBe(false);
+  });
+
+  it('findDocumentUrls pulls the analyzed PDF first and drops images and manifests', () => {
+    const payload = 'x "https://www.linkedin.com/dms/prv/document/media/v2/D562/recruiter-candidate-document-pdf-analyzed/B56/0/1789?m=AQK\\u0026v=beta" y "https://www.linkedin.com/dms/prv/image/v2/D562/recruiter-candidate-document-cover-images_1280/B56/0/1789?m=AQI" z "https://www.linkedin.com/dms/prv/document/pl/v2/D562/recruiter-candidate-document-master-manifest/B56/0/1789?m=AQL" w "https://www.linkedin.com/dms/prv/document/media/v2/D562/other-document/B56/0/1?m=1"';
+    expect(findDocumentUrls(payload)).toEqual([
+      'https://www.linkedin.com/dms/prv/document/media/v2/D562/recruiter-candidate-document-pdf-analyzed/B56/0/1789?m=AQK&v=beta',
+      'https://www.linkedin.com/dms/prv/document/media/v2/D562/other-document/B56/0/1?m=1',
+    ]);
+    expect(findDocumentUrls('nothing here')).toEqual([]);
   });
 });

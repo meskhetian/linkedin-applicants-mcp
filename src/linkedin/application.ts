@@ -166,16 +166,24 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
   const profileUrn = findProfileUrn(ctx, mark);
   const rating = await detectRatingOnPage(page, gen);
 
-  // Contact info shared with the application: mailto:/tel: links, a "Contact" button (Hiring Pro) or the legacy "More" menu
-  let email = extractEmail(text) ?? links.find((l) => l.href.startsWith('mailto:'))?.href.slice(7);
-  let phone = extractPhone(text) ?? links.find((l) => l.href.startsWith('tel:'))?.href.slice(4);
+  // Contact info shared with the application: mailto:/tel: links, a "Contact" button (Hiring Pro) or the legacy "More" menu.
+  // Only the header part of the pane is scanned for free text: the experience section below holds year ranges.
+  const headerText = text.split(/\n\s*(qualifications|screening questions?|experience)\s*\n/i)[0] ?? text;
+  let email = extractEmail(headerText) ?? links.find((l) => l.href.startsWith('mailto:'))?.href.slice(7);
+  let phone = extractPhone(headerText) ?? links.find((l) => l.href.startsWith('tel:'))?.href.slice(4);
   let contactText = '';
+  const contactDiag: Record<string, unknown> = { found: false, clicked: false };
   if (!email || !phone) {
-    const more = (await firstVisible(root, SEL[gen].detail.contactButton, { timeoutMs: 1200 })) ?? (await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 1000 }));
+    const more =
+      (await firstVisible(root, SEL[gen].detail.contactButton, { timeoutMs: 1200 })) ??
+      (await firstVisible(root, ['button:has-text("Contact")'], { timeoutMs: 400 })) ??
+      (await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 1000 }));
+    contactDiag.found = !!more;
     if (more) {
       try {
         const bodyBefore = await page.evaluate(() => document.body.innerText).catch(() => '');
         await human.click(page, more);
+        contactDiag.clicked = true;
         await human.pause('short');
         for (const it of await allOfFirst(page, SEL[gen].detail.contactItems)) contactText += `${(await textOf(it)) ?? ''}\n`;
         // Popovers without ARIA roles: whatever text appeared after the click is the contact card.
@@ -186,6 +194,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
           .map((l) => l.trim())
           .filter((l) => l && !seen.has(l));
         if (appeared.length) contactText += `${appeared.join('\n')}\n`;
+        contactDiag.popoverChars = contactText.length;
         const popover = await page
           .evaluate(() => {
             const roots = Array.from(document.querySelectorAll('[role="menu"], [role="dialog"], [role="tooltip"], .artdeco-dropdown__content'));
@@ -232,6 +241,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     text,
     links,
     contactText,
+    contact: contactDiag,
     screeningText,
     qualificationsText,
     resume,
@@ -258,7 +268,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     hasResume: resume.hasResume,
     resumePath: resume.path,
     resumeFileName: resume.fileName,
-    extra: { rawTextChars: text.length, resumeStrategy: resume.strategy, resumeHost: resume.host, generation: gen, uiVariant: variant, appliedAgo, qualificationsText, resumeDebug: resume.debug },
+    extra: { rawTextChars: text.length, resumeStrategy: resume.strategy, resumeHost: resume.host, generation: gen, uiVariant: variant, appliedAgo, qualificationsText, resumeDebug: resume.debug, contact: contactDiag },
     raw: { headerText: text.slice(0, 1500) },
   };
 }
@@ -403,6 +413,29 @@ interface Saved {
   path: string;
   fileName?: string;
   host?: string;
+  /** Where the bytes came from (signed URL, kept only in the raw capture for debugging). */
+  url?: string;
+}
+
+/** True when the first bytes read like text (JSON, RSC flight data, HTML): never a resume file. */
+export function looksTextual(bytes: Buffer | Uint8Array): boolean {
+  const head = Buffer.from(bytes.subarray(0, 64)).toString('utf8').replace(/^\uFEFF/, '');
+  if (!head.trim()) return false;
+  return /^[\x09\x0a\x0d\x20-\x7e\u00a0-\uffff]+$/.test(head) && !/^%PDF-|^PK\x03\x04|^\{\\rtf/.test(head);
+}
+
+const DOCUMENT_CT_RE = /application\/(pdf|msword|vnd\.openxmlformats-officedocument|rtf)/i;
+
+/**
+ * LinkedIn's resume viewer is a server-driven screen whose payload names the actual document files
+ * (".../dms/prv/document/media/v2/<id>/recruiter-candidate-document-pdf-analyzed/..."). Pull those URLs out of
+ * any text response so the file can be fetched directly even when the viewer never requests the PDF itself.
+ */
+export function findDocumentUrls(text: string): string[] {
+  const unescaped = text.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  const found = unescaped.match(/https?:\/\/[^"'\\\s<>)\]]+\/dms\/prv\/document\/[^"'\\\s<>)\]]+/g) ?? [];
+  const score = (u: string) => (/pdf-analyzed/i.test(u) ? 0 : /manifest|cover-image|thumbnail|\/image\//i.test(u) ? 2 : 1);
+  return [...new Set(found)].filter((u) => score(u) < 2).sort((a, b) => score(a) - score(b));
 }
 
 /** Pure decision for an intercepted response: is this a resume file, and must it be kept away from Chrome's download manager? */
@@ -416,7 +449,10 @@ export function decideResumeIntercept(input: {
 }): { isFile: boolean; swallow: boolean } {
   const ct = input.contentType ?? '';
   const cd = input.contentDisposition ?? '';
-  const isFile = !!sniffExt(input.bytes) || /application\/(pdf|msword|vnd\.openxmlformats-officedocument|octet-stream|rtf)/i.test(ct) || /attachment/i.test(cd);
+  const textual = looksTextual(input.bytes);
+  // Sniffed magic bytes win; a document content type counts; octet-stream or an attachment header only when the
+  // bytes are not plain text (LinkedIn's viewer payloads are text and must never be mistaken for a resume).
+  const isFile = !!sniffExt(input.bytes) || (!textual && (DOCUMENT_CT_RE.test(ct) || /application\/octet-stream/i.test(ct) || /attachment/i.test(cd)));
   // A navigation to a file (same tab or popup) or any attachment would start a Chrome download: answer it ourselves.
   const swallow = isFile && (input.resourceType === 'document' || /attachment/i.test(cd) || !input.fromWorkingPage);
   return { isFile, swallow };
@@ -434,6 +470,8 @@ class ResumeTrap {
   private resolvers: Array<(s: Saved | undefined) => void> = [];
   private armed = false;
   readonly seen: string[] = [];
+  /** Document URLs named inside viewer payloads, best first. */
+  readonly documentUrls = new Set<string>();
 
   constructor(
     private readonly ctx: ScrapeContext,
@@ -449,7 +487,10 @@ class ResumeTrap {
     } catch {
       /* detached frame */
     }
-    const candidate = looksLikeResumeUrl(url) || (!fromWorkingPage && (req.resourceType() === 'document' || req.isNavigationRequest()));
+    const type = req.resourceType();
+    // Resume-looking URLs anywhere, everything a popup loads, and the LinkedIn fetch/XHR calls the click triggers
+    // (the resume viewer payload names the document files; see findDocumentUrls).
+    const candidate = looksLikeResumeUrl(url) || (!fromWorkingPage && (type === 'document' || req.isNavigationRequest())) || ((type === 'fetch' || type === 'xhr') && /linkedin\.com\//.test(url));
     if (!candidate) {
       await route.continue().catch(() => {});
       return;
@@ -470,10 +511,12 @@ class ResumeTrap {
       if (isFile && !this.saved) {
         const s = saveBytes(body, headers['content-type'], headers['content-disposition'], resp.url(), this.saveDir);
         if (s) {
-          this.saved = { ...s, host: safeHost(resp.url()) };
+          this.saved = { ...s, host: safeHost(resp.url()), url: resp.url() };
           this.ctx.log.debug('resume captured at the network layer', { url: url.slice(0, 200), bytes: body.length, swallow });
           this.settle();
         }
+      } else if (!isFile && body.length < 4_000_000 && looksTextual(body)) {
+        for (const u of findDocumentUrls(body.toString('utf8'))) this.documentUrls.add(u);
       }
       if (swallow) await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } });
       else await route.fulfill({ response: resp, body });
@@ -599,6 +642,15 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
     const direct = await clickAndTrap(ctx, btn, trap, saveDir, 8000);
     if (direct) return { ...direct, hasResume: true };
 
+    // The viewer payload names the document files: fetch the best one ourselves (same-origin, cookies included).
+    for (const docUrl of [...trap.documentUrls].slice(0, 2)) {
+      const saved = await fetchResume(ctx, docUrl, saveDir);
+      if (saved) {
+        await closeViewer();
+        return { ...saved, strategy: 'viewer', hasResume: true };
+      }
+    }
+
     // viewer opened: look for the file inside it
     let url: string | undefined;
     for (let i = 0; i < 3 && !url; i++) {
@@ -640,6 +692,7 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
     }
     const debug = await resumeDebugInfo(ctx, mark);
     debug.trapSeen = trap.seen.slice(0, 20);
+    debug.documentUrls = [...trap.documentUrls].slice(0, 5);
     debug.downloadsSeen = downloadsSeen;
     await closeViewer();
     log.warn('resume control found but no file could be retrieved', { url: page.url(), viewerUrl: url, tabs: debug.tabs, frames: debug.frames, fetched: debug.fetched, trapSeen: debug.trapSeen });
@@ -705,7 +758,7 @@ async function fetchResume(ctx: ScrapeContext, url: string, saveDir: string, fro
       return { b64: btoa(s), ct: r.headers.get('content-type'), cd: r.headers.get('content-disposition'), finalUrl: r.url };
     }, url);
     const saved = saveBytes(Buffer.from(res.b64, 'base64'), res.ct, res.cd, res.finalUrl || url, saveDir);
-    if (saved) return { ...saved, host };
+    if (saved) return { ...saved, host, url: res.finalUrl || url };
     ctx.log.debug('resume url returned html/empty (login wall or expired link)', { url: url.slice(0, 200), ct: res.ct });
   } catch (e) {
     ctx.log.debug('in-page resume fetch failed; trying context request', { url: url.slice(0, 200), error: errorMessage(e) });
@@ -714,7 +767,7 @@ async function fetchResume(ctx: ScrapeContext, url: string, saveDir: string, fro
     const r = await ctx.page.context().request.get(url, { headers: { referer: 'https://www.linkedin.com/' }, maxRedirects: 5, timeout: 30_000 });
     if (!r.ok()) return undefined;
     const saved = saveBytes(await r.body(), r.headers()['content-type'], r.headers()['content-disposition'], r.url(), saveDir);
-    return saved ? { ...saved, host } : undefined;
+    return saved ? { ...saved, host, url: r.url() } : undefined;
   } catch (e) {
     ctx.log.debug('context request for resume failed', { url: url.slice(0, 200), error: errorMessage(e) });
     return undefined;
@@ -723,7 +776,9 @@ async function fetchResume(ctx: ScrapeContext, url: string, saveDir: string, fro
 
 function saveBytes(bytes: Buffer, contentType: string | null | undefined, contentDisposition: string | null | undefined, finalUrl: string, saveDir: string): { path: string; fileName?: string } | undefined {
   const sniffed = sniffExt(bytes);
-  if (bytes.length < 200 || (!sniffed && /text\/html/i.test(contentType ?? '')) || (!sniffed && /^\s*<(!doctype|html)/i.test(bytes.subarray(0, 64).toString('latin1')))) return undefined;
+  if (bytes.length < 200) return undefined;
+  // Login walls, expired links and viewer payloads come back as HTML, JSON or RSC text: not a resume.
+  if (!sniffed && (looksTextual(bytes) || /text\/html/i.test(contentType ?? '')) && !DOCUMENT_CT_RE.test(contentType ?? '')) return undefined;
   const fileName = filenameFromContentDisposition(contentDisposition) ?? fileNameFromUrl(finalUrl);
   const ext = pickResumeExt({ fileName, contentType, bytes });
   const out = path.join(saveDir, `resume.${ext}`);

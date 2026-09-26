@@ -116,7 +116,7 @@ export async function scrollUntilStable(page: Page, scrollOnce: () => Promise<vo
 }
 
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
-const PHONE_RE = /(\+?\d[\d\s().-]{7,}\d)/;
+const PHONE_RE = /(\+?\(?\d[\d\s().-]{7,}\d)/;
 
 export function extractEmail(text: string | undefined): string | undefined {
   if (!text) return undefined;
@@ -125,10 +125,20 @@ export function extractEmail(text: string | undefined): string | undefined {
 
 export function extractPhone(text: string | undefined): string | undefined {
   if (!text) return undefined;
-  const m = PHONE_RE.exec(text.replace(/ /g, ' '));
+  // Year ranges ("2009-2011", "2021 - Present") and counters ("6/6") are not phone numbers.
+  const cleaned = text
+    .replace(/\u00a0/g, ' ')
+    .replace(/\b(19|20)\d{2}\s*[-\u2013]\s*((19|20)\d{2}|present|now|current)\b/gi, ' ')
+    .replace(/\b\d{1,2}\/\d{1,2}\b/g, ' ');
+  const m = PHONE_RE.exec(cleaned);
   if (!m) return undefined;
-  const digits = m[1]!.replace(/\D/g, '');
-  return digits.length >= 8 && digits.length <= 15 ? m[1]!.trim() : undefined;
+  const candidate = m[1]!.trim();
+  const digits = candidate.replace(/\D/g, '');
+  if (digits.length > 15) return undefined;
+  // A bare run of more than ten digits with no separators is an id (application, member), not a phone number.
+  if (/^\d+$/.test(candidate) && digits.length > 10) return undefined;
+  // Local numbers can be short, but without a country code we want at least 9 digits to avoid dates and ids.
+  return digits.length >= (candidate.startsWith('+') ? 8 : 9) ? candidate : undefined;
 }
 
 /** "Applied 3 days ago" / "2 weeks ago" → ISO date (approximate). */
