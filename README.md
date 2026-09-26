@@ -1,6 +1,6 @@
 # linkedin-applicants-mcp
 
-Export the applicants of your LinkedIn job posts (lists, application details, resume files and full profiles) through your own logged-in Chrome, paced like a person, driven from Claude via MCP.
+Export the applicants of your LinkedIn job posts (lists, application details, resume files and full profiles) through your own logged-in Chrome, paced like a person. Drive it from Claude, Codex, Cursor or any MCP client, browse and search the results in a local dashboard, and export them to CSV or JSON.
 
 [![CI](https://github.com/meskhetian/linkedin-applicants-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/meskhetian/linkedin-applicants-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
