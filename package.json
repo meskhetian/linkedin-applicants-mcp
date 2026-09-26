@@ -1,0 +1,55 @@
+{
+  "name": "linkedin-applicants-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that drives your own logged-in Chrome to export LinkedIn job applicants (lists, application details, resumes, full profiles) with human-like pacing and a resumable queue.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Meskhetian Xenophon (https://github.com/meskhetian)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meskhetian/linkedin-applicants-mcp.git"
+  },
+  "bugs": { "url": "https://github.com/meskhetian/linkedin-applicants-mcp/issues" },
+  "homepage": "https://github.com/meskhetian/linkedin-applicants-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "linkedin",
+    "hiring",
+    "applicants",
+    "recruiting",
+    "playwright",
+    "patchright",
+    "claude"
+  ],
+  "engines": { "node": ">=22.13" },
+  "bin": { "linkedin-applicants-mcp": "dist/index.js" },
+  "main": "dist/index.js",
+  "files": ["dist", "README.md", "LICENSE", "scripts"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "worker": "tsx src/worker-cli.ts",
+    "dashboard": "tsx src/dashboard.ts",
+    "login": "tsx scripts/login.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "mammoth": "^1.12.3",
+    "patchright": "^1.63.0",
+    "unpdf": "^1.8.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.2"
+  }
+}

@@ -1,0 +1,113 @@
+name: LinkedIn markup changed
+description: A scraper stopped finding jobs, applicants, contact info, resumes or profile sections because LinkedIn changed its page.
+title: "[LinkedIn changed]: "
+labels: ["linkedin-markup", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        LinkedIn ships two DOM generations side by side and rotates class names, so this is expected to happen
+        from time to time. The fastest path to a fix is a good `debug_snapshot` plus a description of what you
+        saw. The [Troubleshooting](https://github.com/meskhetian/linkedin-applicants-mcp/blob/main/README.md#troubleshooting) section of the README and
+        [CONTRIBUTING.md](https://github.com/meskhetian/linkedin-applicants-mcp/blob/main/CONTRIBUTING.md#when-linkedin-changes-its-markup) explain the tools.
+
+        > **Privacy reminder.** Snapshots, screenshots, captured JSON and logs contain real applicants' names,
+        > headlines, contact details and photos. **Before attaching anything, remove or black out all applicant
+        > personal data**, application ids and profile URLs. Do not attach the raw `debug/` folder, `db.sqlite`,
+        > resumes or anything from `chrome-profile/`. If you cannot redact a file, describe it instead of
+        > attaching it. Maintainers will ask you to delete any attachment that still contains personal data.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I have removed all applicant personal data (names, photos, contact details, ids, profile URLs) from every attachment and pasted snippet.
+          required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Which tool / step failed?
+      options:
+        - jobs_sync (posted-jobs page)
+        - applicants_sync (applicant list, pagination, ratings filter)
+        - applicants_fetch_details (application page: contact info / screening answers / rating)
+        - applicants_fetch_details (resume download or viewer)
+        - applicants_fetch_profiles or profile step (profile page / details sections / Voyager)
+        - Login / logged-in detection
+        - Checkpoint detection (false positive or missed)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: generation
+    attributes:
+      label: Which DOM generation was the page?
+      description: >-
+        Legacy = the classic list with stable class names such as `hiring-applicants__list-item` and
+        `artdeco-*` (25 per page, rating buckets). SDUI = the 2026 "Hiring Pro" React UI with hashed class
+        names and `data-view-name` attributes. Tip: if `debug_find` matches `.hiring-applicants__list-item`
+        on the page, it is legacy; if it matches nothing and the HTML is full of hashed classes, it is sdui.
+      options:
+        - legacy
+        - sdui
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message / `queue_status` excerpt (redacted)
+      description: For example "Could not find applicant cards", `stoppedEarly`, `filterParamIgnored`, `needsHuman` reason, or the cool-down message.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: snapshot
+    attributes:
+      label: debug_snapshot output paths and what they show
+      description: |
+        Run `queue_pause`, then `debug_snapshot` on the failing page and paste the paths it returned
+        (`<data>/debug/<name>/...`). Describe what the screenshot shows (for example "the list renders but each
+        row is now a `<div role="listitem">` with no anchor") and paste **redacted** snippets of the relevant
+        HTML or page text. Do not paste whole files.
+      placeholder: |
+        Snapshot: ~/.linkedin-applicants-mcp/debug/applicants-2026-10-03/ (screenshot.png, page.html, page.txt, captures.json)
+        Observation: ...
+        Redacted HTML fragment:
+        <div data-view-name="hiring-applicant-row" ...>
+    validations:
+      required: true
+  - type: textarea
+    id: selectors-tried
+    attributes:
+      label: Selectors you tried with `debug_find` / `debug_click` (and results)
+      description: Anything that matched or did not, with match counts. Candidates based on `data-view-name`, `componentkey`, `aria-label`, `role` or text are the most useful.
+      render: text
+  - type: textarea
+    id: captures
+    attributes:
+      label: Relevant `debug_captures` endpoints (redacted)
+      description: If the page fetched JSON that contains the data (endpoint path + top-level shape). Remove values.
+      render: text
+  - type: input
+    id: date
+    attributes:
+      label: When did it last work, and when did you see it fail?
+      placeholder: "worked 2026-09-25, failing since 2026-10-03"
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "macOS 15.6, Node 24.4.0, Chrome 141, LINKEDIN_MCP_PROFILE_STRATEGY=auto"
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to open a PR with the selector fix and a fixture-based test (fictional names only).

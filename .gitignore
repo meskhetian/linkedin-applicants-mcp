@@ -1,0 +1,23 @@
+node_modules/
+dist/
+coverage/
+data/
+*.tsbuildinfo
+
+# secrets / local config
+.env
+.env.*
+!.env.example
+.claude/
+
+# local data that must never be committed
+*.sqlite
+*.sqlite-*
+*.db
+
+# logs / OS / editors
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

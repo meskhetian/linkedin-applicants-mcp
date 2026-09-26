@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.x', '24.x', '26.x']
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # postinstall only prints a reminder and is silent when CI=true (GitHub sets it).
+      # patchright does not download a browser on install; none is needed for the tests.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # Unit tests + stdio smoke test. The smoke test spawns node dist/index.js with a
+      # temporary data directory and never opens a browser or contacts LinkedIn.
+      - name: Test
+        run: npm test
+        env:
+          LINKEDIN_MCP_AUTOSTART_WORKER: 'false'
+
+  lint-docs:
+    name: Docs (relative links)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      # Zero-dependency check: every relative link in a Markdown file must point at a file or
+      # directory that exists in the repository. External URLs and anchors are not fetched.
+      - name: Check relative Markdown links
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', 'coverage']);
+          const files = [];
+          (function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isDirectory()) {
+                if (!SKIP_DIRS.has(entry.name)) walk(path.join(dir, entry.name));
+              } else if (entry.name.toLowerCase().endsWith('.md')) {
+                files.push(path.join(dir, entry.name));
+              }
+            }
+          })('.');
+
+          const linkRe = /\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)/g;
+          const failures = [];
+          for (const file of files) {
+            const text = fs.readFileSync(file, 'utf8');
+            for (const match of text.matchAll(linkRe)) {
+              const raw = match[1];
+              if (/^(https?:|mailto:|#|tel:)/i.test(raw)) continue;
+              const target = raw.split('#')[0];
+              if (!target) continue;
+              const resolved = path.resolve(path.dirname(file), decodeURI(target));
+              if (!fs.existsSync(resolved)) failures.push(`${file}: broken link -> ${raw}`);
+            }
+          }
+
+          if (failures.length) {
+            console.error(failures.join('\n'));
+            process.exit(1);
+          }
+          console.log(`Checked ${files.length} Markdown file(s); all relative links resolve.`);
+          JS

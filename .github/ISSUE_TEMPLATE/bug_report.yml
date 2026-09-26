@@ -1,0 +1,91 @@
+name: Bug report
+description: Something does not work as documented (not a LinkedIn markup change; there is a separate template for that).
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Before you continue:
+
+        - If a scraper stopped finding cards/rows/buttons after working before, LinkedIn probably changed its
+          markup. Please use the **"LinkedIn markup changed"** template instead.
+        - **Privacy:** this tool handles other people's personal data. Remove applicant names, headlines,
+          emails, phone numbers, application ids and profile URLs from every log line, screenshot or file
+          you attach. Never attach `db.sqlite`, resumes, `profile.json` or your `chrome-profile/`.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I have removed all applicant personal data (names, contact details, ids, profile URLs) from this report and its attachments.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Called `applicants_fetch_details` for job 123...
+        2. `queue_status` showed ...
+        3. Expected ..., got ...
+    validations:
+      required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Which tool or command was involved?
+      multiple: true
+      options:
+        - browser_status / browser_open_login / browser_close
+        - jobs_sync / jobs_list
+        - applicants_sync
+        - applicants_fetch_details / applicants_fetch_profiles
+        - applicants_list / applicant_get / resume_text / applicants_export
+        - queue_* / pacing_*
+        - debug_*
+        - review_applicants prompt
+        - npm run worker
+        - npm run dashboard
+        - npm run login / scripts/launch-chrome.sh
+        - Install / build / tests
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: queue-status
+    attributes:
+      label: Output of `queue_status` (redacted)
+      description: Paste the relevant part. Remove anything that identifies an applicant.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines (redacted)
+      description: From stderr, `~/Library/Logs/Claude/mcp*.log`, or `<data>/logs/`. `LINKEDIN_MCP_LOG_LEVEL=debug` helps.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "0.1.0 or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, Node.js version, Chrome version, MCP client (Claude Desktop / Claude Code / other).
+      placeholder: "macOS 15.6, Node 24.4.0, Chrome 141, Claude Desktop 1.x"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Non-default configuration
+      description: Any `LINKEDIN_MCP_*` variables or `pacing_set` overrides you changed (browser mode, profile strategy, speed, caps...).
+      render: shell
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?

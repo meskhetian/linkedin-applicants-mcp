@@ -1,0 +1,88 @@
+import { describe, expect, it } from 'vitest';
+import { decideNextPage, parseAppliedOn, parseApplicantCardText, parseProRowText } from '../src/linkedin/applicants.js';
+
+describe('parseApplicantCardText (legacy)', () => {
+  it('parses a legacy-style card', () => {
+    const p = parseApplicantCardText('Jane Doe\nJane Doe\nSenior Backend Engineer at Acme\nBerlin, Germany\nApplied 3 days ago\nMeets all must-have qualifications');
+    expect(p).toMatchObject({ fullName: 'Jane Doe', headline: 'Senior Backend Engineer at Acme', location: 'Berlin, Germany', appliedAgo: 'Applied 3 days ago', meetsScreening: true });
+  });
+
+  it('parses an SDUI-style card with badges and screening counters', () => {
+    const p = parseApplicantCardText('New\nJohn Smith · 2nd\nData Scientist | Python, SQL\nIstanbul, Türkiye\n2/3 must-have qualifications\n2 weeks ago');
+    expect(p.fullName).toBe('John Smith');
+    expect(p.headline).toBe('Data Scientist | Python, SQL');
+    expect(p.location).toBe('Istanbul, Türkiye');
+    expect(p.appliedAgo).toBe('2 weeks ago');
+    expect(p.meetsScreening).toBe(false);
+  });
+
+  it('handles a card with only name and location', () => {
+    const p = parseApplicantCardText('Ali Veli\nAnkara, Türkiye\nApplied 1 hour ago');
+    expect(p.fullName).toBe('Ali Veli');
+    expect(p.location).toBe('Ankara, Türkiye');
+    expect(p.headline).toBeUndefined();
+  });
+});
+
+describe('parseProRowText (Hiring Pro)', () => {
+  it('parses a column-style row', () => {
+    const p = parseProRowText('Jane Doe\nSenior Backend Engineer\nAcme\nBerlin, Germany\n3/3 Must-have\n1/2 Preferred\nApplied on: Sep 20, 2026');
+    expect(p).toMatchObject({ fullName: 'Jane Doe', title: 'Senior Backend Engineer', company: 'Acme', location: 'Berlin, Germany', appliedOn: 'Applied on: Sep 20, 2026', meetsScreening: true });
+    expect(p.qualificationsText).toBe('3/3 Must-have · 1/2 Preferred');
+  });
+
+  it('splits "Title at Company" and ignores badges', () => {
+    const p = parseProRowText('Top fit\nJohn Smith\nData Scientist at Globex\nIstanbul, Türkiye\n1/3 Must-have\nApplied 2 days ago');
+    expect(p).toMatchObject({ fullName: 'John Smith', title: 'Data Scientist', company: 'Globex', location: 'Istanbul, Türkiye', meetsScreening: false });
+  });
+});
+
+describe('parseAppliedOn', () => {
+  const now = new Date('2026-09-25T12:00:00Z');
+  it('handles relative and absolute forms', () => {
+    expect(parseAppliedOn('Applied 3 days ago', now)).toBe('2026-09-22T12:00:00.000Z');
+    expect(parseAppliedOn('Applied on: Sep 20, 2026', now)?.slice(0, 10)).toBe('2026-09-20');
+    expect(parseAppliedOn('Applied on Sep 20', now)?.slice(0, 7)).toBe('2026-09');
+    expect(parseAppliedOn(undefined, now)).toBeUndefined();
+    expect(parseAppliedOn('nonsense', now)).toBeUndefined();
+  });
+});
+
+describe('decideNextPage', () => {
+  const base = { cardsOnPage: 25, start: 0, hasNextButton: false, pagesThisRun: 1 };
+  it('stops on empty pages and when the run budget is used', () => {
+    expect(decideNextPage({ ...base, newIdsOnPage: 0, cardsOnPage: 0 }).action).toBe('stop');
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, maxPages: 1 }).action).toBe('stop');
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, maxPages: 2 }).action).toBe('offset');
+  });
+  it('stops at the reported total in offset mode but keeps scrolling in scroll mode', () => {
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, start: 2975, total: 3000 }).action).toBe('stop');
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, start: 2950, total: 3000 }).action).toBe('offset');
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, start: 2975, total: 3000, mode: 'scroll' }).action).toBe('scroll');
+  });
+  it('falls back to buttons or scrolling when the offset parameter is ignored', () => {
+    expect(decideNextPage({ ...base, newIdsOnPage: 0, hasNextButton: true })).toMatchObject({ action: 'button' });
+    expect(decideNextPage({ ...base, newIdsOnPage: 0, hasNextButton: false })).toMatchObject({ action: 'scroll' });
+    expect(decideNextPage({ ...base, newIdsOnPage: 0, hasNextButton: false, mode: 'scroll' })).toMatchObject({ action: 'stop' });
+    expect(decideNextPage({ ...base, newIdsOnPage: 0, hasNextButton: false, mode: 'buttons' })).toMatchObject({ action: 'stop' });
+  });
+  it('keeps using the detected mode', () => {
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, hasNextButton: true, mode: 'buttons' }).action).toBe('button');
+    expect(decideNextPage({ ...base, newIdsOnPage: 25, hasNextButton: false, mode: 'buttons' }).action).toBe('stop');
+  });
+});
+
+describe('parseProRowText (list card as rendered 2026-09)', () => {
+  it('parses name / degree / headline / location / qualification counters', () => {
+    const p = parseProRowText('Dana Whitfield\n\n· 2nd\n\nHead of Operations | Scaling logistics platforms | Team builder\n\nSan Francisco Bay Area\n\n6/6\n\nMust-have\n\n5/5\n\nPreferred');
+    expect(p.fullName).toBe('Dana Whitfield');
+    expect(p.title).toBe('Head of Operations | Scaling logistics platforms | Team builder');
+    expect(p.company).toBeUndefined();
+    expect(p.location).toBe('San Francisco Bay Area');
+    expect(p.meetsScreening).toBe(true);
+    expect(p.qualificationsText).toBe('6/6 · Must-have · 5/5 · Preferred');
+    const q = parseProRowText('Priya Raman\n\n· 2nd\n\nDirector, Strategy & Operations\n\nAustin, Texas, United States\n\n5/6\n\nMust-have\n\n5/5\n\nPreferred');
+    expect(q.location).toBe('Austin, Texas, United States');
+    expect(q.meetsScreening).toBe(false);
+  });
+});

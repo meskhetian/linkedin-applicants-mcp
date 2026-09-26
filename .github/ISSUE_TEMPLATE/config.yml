@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/meskhetian/linkedin-applicants-mcp/security/advisories/new
+    about: Please report security issues privately through GitHub's vulnerability reporting, not as a public issue.
+  - name: Questions and usage help
+    url: https://github.com/meskhetian/linkedin-applicants-mcp/discussions
+    about: Ask how to use the server, share pacing experience, or discuss ideas before opening a feature request.
