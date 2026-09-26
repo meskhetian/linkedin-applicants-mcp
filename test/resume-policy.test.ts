@@ -9,6 +9,8 @@ describe('shouldSkipResumeDownload', () => {
 
   it('never skips on the first attempt, when the resume was not wanted, after a closed tab, or after unrelated errors', () => {
     expect(shouldSkipResumeDownload({ attempts: 0, lastError: undefined }, true)).toBe(false);
+    // Requeues that do not count an attempt still carry the marker.
+    expect(shouldSkipResumeDownload({ attempts: 0, lastError: 'Browser lost: BrowserNotConnectedError: Chrome is not connected' }, true)).toBe(true);
     expect(shouldSkipResumeDownload({ attempts: 1, lastError: 'Browser lost: browser has been closed' }, false)).toBe(false);
     // Same Playwright text, but the session stayed connected so the worker did not add the marker.
     expect(shouldSkipResumeDownload({ attempts: 1, lastError: 'Error: page.goto: Target page, context or browser has been closed' }, true)).toBe(false);

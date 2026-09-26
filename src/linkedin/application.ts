@@ -565,7 +565,11 @@ class ResumeTrap {
     }
     this.seen.push(redactUrl(url));
     this.documentUrls.add(url);
-    await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } }).catch(() => {});
+    // The working tab keeps its page (204 does not commit); a popup gets a blank page that commits, so Playwright
+    // reports it and clickAndTrap can close it.
+    const origin = this.originOf(req);
+    if (origin === 'popup') await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title></title>' }).catch(() => {});
+    else await route.fulfill({ status: 204, headers: { 'content-type': 'text/plain', 'cache-control': 'no-store' } }).catch(() => {});
     this.settle();
   };
 
@@ -730,7 +734,11 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
       if (saved) return { ...saved, strategy: 'attachment', hasResume: true };
     }
     const direct = await clickAndTrap(ctx, btn, trap, saveDir, 8000);
-    if (direct) return { ...direct, hasResume: true };
+    if (direct) {
+      // A recruiter closes the viewer they opened; the dismiss control is only pressed when it is there.
+      if (await firstVisible(page, SEL[gen].detail.dismiss, { timeoutMs: 400 })) await closeViewer();
+      return { ...direct, hasResume: true };
+    }
     assertPageAlive(page);
 
     // viewer opened: look for the file inside it

@@ -383,7 +383,7 @@ export class Worker {
       return;
     }
     if (e instanceof BrowserNotConnectedError) {
-      db.requeueTask(task.id, new Date(Date.now() + 10 * 60_000).toISOString(), msg);
+      db.requeueTask(task.id, new Date(Date.now() + 10 * 60_000).toISOString(), `Browser lost: ${raw}`);
       db.addEvent('error', 'browser', msg, { taskId: task.id });
       tlog.error('browser unavailable; retrying in 10 minutes', { error: msg });
       await this.idle(60_000, 120_000);

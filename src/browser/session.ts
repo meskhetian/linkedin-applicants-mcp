@@ -137,6 +137,14 @@ export class BrowserSession {
       }
       this.browser = browser;
       this.context = browser.contexts()[0] ?? (await browser.newContext({ acceptDownloads: false }));
+      // The attached default context keeps Chrome's own download settings; deny downloads at the browser level so
+      // an automation-triggered download can never start (Chrome 154 crashes on them).
+      try {
+        const cdp = await browser.newBrowserCDPSession();
+        await cdp.send('Browser.setDownloadBehavior', { behavior: 'deny' });
+      } catch (e) {
+        log.warn('could not deny downloads in the attached Chrome; resume files are still read from the network', { error: errorMessage(e) });
+      }
       browser.once('disconnected', () => this.onContextGone('cdp disconnected'));
       this.context.once('close', () => this.onContextGone('context closed'));
       return;
