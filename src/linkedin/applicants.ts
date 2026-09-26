@@ -941,6 +941,91 @@ export function parseAppliedOnDate(text: string | undefined): string | undefined
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
+/**
+ * In the detail drawer, open Share and use "Copy application URL". Three ways to read what LinkedIn produced, in
+ * order: a temporary hook on the page's clipboard calls, the responses LinkedIn fetched meanwhile, and finally the
+ * system clipboard itself (read with a granted permission; the previous text is put back afterwards).
+ */
+async function copiedApplicationId(ctx: ScrapeContext): Promise<string | undefined> {
+  const { page, human, log } = ctx;
+  const mark = ctx.capture.mark();
+  let previousClipboard: string | undefined;
+  try {
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
+    previousClipboard = await page.evaluate(() => navigator.clipboard.readText()).catch(() => undefined);
+  } catch {
+    /* permissions unavailable: hooks and network still work */
+  }
+  const armed = await page
+    .evaluate(() => {
+      const w = window as unknown as { __liCopied?: string[]; __liRestore?: () => void };
+      if (w.__liRestore) return true;
+      w.__liCopied = [];
+      const clip = navigator.clipboard;
+      const origWrite = clip?.writeText ? clip.writeText.bind(clip) : undefined;
+      const origExec = document.execCommand.bind(document);
+      if (clip && origWrite) {
+        clip.writeText = (t: string) => {
+          w.__liCopied!.push(String(t));
+          return origWrite(t);
+        };
+      }
+      document.execCommand = (cmd: string, ...rest: unknown[]) => {
+        if (cmd === 'copy') {
+          const active = document.activeElement as HTMLInputElement | null;
+          w.__liCopied!.push(window.getSelection()?.toString() || active?.value || '');
+        }
+        return (origExec as (c: string, ...r: unknown[]) => boolean)(cmd, ...rest);
+      };
+      w.__liRestore = () => {
+        if (clip && origWrite) clip.writeText = origWrite;
+        document.execCommand = origExec;
+        delete w.__liRestore;
+      };
+      return true;
+    })
+    .catch(() => false);
+  const steps: Record<string, unknown> = { armed };
+  try {
+    const share = await firstVisible(page, ['button:has-text("Share")'], { timeoutMs: 3000 });
+    steps.shareFound = !!share;
+    if (!share) return undefined;
+    await human.click(page, share, { noScroll: true });
+    const copy = await firstVisible(page, [':text-is("Copy application URL")', ':text-matches("^Copy application URL", "i")', '[role="menuitem"]:has-text("Copy application URL")'], { timeoutMs: 4000 });
+    steps.copyFound = !!copy;
+    if (!copy) return undefined;
+    await human.click(page, copy, { noScroll: true });
+    await human.pauseMs(700, 1400);
+    const copied = await page.evaluate(() => (window as unknown as { __liCopied?: string[] }).__liCopied ?? []).catch(() => [] as string[]);
+    steps.hooked = copied.length;
+    let url = copied.find((t) => /applicationId=\d+/.test(t));
+    if (!url) {
+      for (const e of ctx.capture.since(mark)) {
+        const m = /applicationId=(\d+)/.exec(e.body);
+        if (m) {
+          url = `?applicationId=${m[1]}`;
+          steps.viaNetwork = true;
+          break;
+        }
+      }
+    }
+    if (!url) {
+      const text = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '');
+      if (/applicationId=\d+/.test(text)) {
+        url = text;
+        steps.viaClipboard = true;
+      }
+    }
+    steps.ok = !!url;
+    return url ? parseApplicationId(url) : undefined;
+  } finally {
+    log.info('share menu lookup', steps);
+    await page.evaluate(() => (window as unknown as { __liRestore?: () => void }).__liRestore?.()).catch(() => {});
+    if (previousClipboard !== undefined) await page.evaluate((t) => navigator.clipboard.writeText(t), previousClipboard).catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+}
+
 interface TableRowOnPage extends ParsedTableRow {
   index: number;
 }
@@ -1008,16 +1093,37 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
     const missing = rows.filter((r) => db.applicantIdsByName(jobId, r.fullName).length === 0);
     log.info('table sweep page read', { jobId, offset, rows: rows.length, missing: missing.length });
     opts.onPage?.([], st.pagesThisRun - 1, offset + TABLE_PAGE_SIZE);
-    for (const row of missing) {
-      // Open the row to learn its application id, store it, and come back to the same table page.
+    let lastId: string | undefined;
+    for (const [i, row] of missing.entries()) {
+      // A row click opens a detail drawer in the same page (the URL does not change). The drawer shows the profile
+      // link, and its Share menu offers "Copy application URL", which carries the application id. The table page is
+      // reloaded between rows so a stale drawer can never be read for the next applicant.
+      if (i > 0) {
+        await human.goto(page, tableUrl(offset));
+        await ctx.assertHealthy();
+        await human.pause('read');
+      }
       const rowLoc = page.locator(TABLE_ROW_SELECTOR).nth(row.index);
       try {
         await human.pause('short');
         await human.click(page, rowLoc);
-        await page.waitForURL(/applicationId=\d+/, { timeout: 20_000 });
+        const profileLink = await firstVisible(page, ['a[data-view-name="hiring-applicant-view-profile"]', 'a:has-text("View full profile")'], { timeoutMs: 15_000 });
+        if (!profileLink) throw new Error('detail drawer did not open');
         await ctx.assertHealthy();
-        const applicationId = parseApplicationId(page.url());
+        const profileHref = await attrOf(profileLink, 'href');
+        // The drawer must belong to this row: its header links the same name to the profile.
+        const drawerName = ((await textOf(await firstPresent(page, ['a[href*="/in/"]:not([data-view-name]):visible', 'a[href*="/in/"]:visible']))) ?? '').split('\n')[0]!.trim();
+        if (drawerName && drawerName.localeCompare(row.fullName, undefined, { sensitivity: 'base' }) !== 0) {
+          log.warn('table sweep drawer shows another applicant; skipping this row', { jobId, offset, row: row.index });
+          continue;
+        }
+        const applicationId = await copiedApplicationId(ctx);
+        if (applicationId && applicationId === lastId) {
+          log.warn('table sweep got the same application id twice; skipping this row', { jobId, offset, row: row.index });
+          continue;
+        }
         if (applicationId) {
+          lastId = applicationId;
           const a: Applicant = {
             applicationId,
             jobId,
@@ -1026,6 +1132,7 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
             location: row.location,
             appliedAt: parseAppliedOnDate(row.appliedOn),
             rating: ratingFromTableLabel(row.ratingLabel),
+            profileUrl: normalizeProfileUrl(profileHref),
             listSyncedAt: now,
             raw: { source: 'table-sweep', rowText: `${row.fullName}\n${row.appliedOn ?? ''}`, qualifications: row.qualificationsText, fitLabel: row.ratingLabel, tableOffset: offset },
           };
@@ -1033,14 +1140,12 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
           st.collected.push(a);
           recovered++;
           log.info('table sweep recovered an applicant the list never showed', { jobId, applicationId, offset });
+        } else {
+          log.warn('table sweep could not learn the application id of a row', { jobId, offset, hasProfile: !!profileHref });
         }
         await human.pause('betweenApplicants');
-        await human.goto(page, tableUrl(offset));
-        await ctx.assertHealthy();
-        await human.pause('read');
       } catch (e) {
         log.warn('table sweep could not open a row', { jobId, offset, error: errorMessage(e) });
-        await human.goto(page, tableUrl(offset)).catch(() => {});
       }
     }
     const done = rows.length < TABLE_PAGE_SIZE || (totalReported !== undefined && offset + TABLE_PAGE_SIZE >= totalReported);
