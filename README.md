@@ -41,6 +41,14 @@ It binds to `127.0.0.1` only, applicant data is personal information, serves GET
 
 *The dashboard with sample data: overview tiles, per-job progress meters and the applicant table.*
 
+## Roadmap
+
+- **Next version: ATS importers.** Push exported applicants, resumes and profiles into Ashby, Lever, Workable, Greenhouse and similar applicant tracking systems through their APIs, so LinkedIn applicants land in the pipeline you already use.
+- OCR for scanned/image resumes (text extraction currently covers PDF, DOCX and plain text).
+- More dashboard filters and saved views.
+- Test fixtures for the legacy (Ember) dashboard so both UI generations are covered by CI.
+- Download-free capture of LinkedIn's own "Save to PDF" per profile (`savePdf` is reserved on the fetch tools and skipped with a warning while Chrome downloads are denied, see the Troubleshooting entry on the Chrome 154 download crash).
+
 ## How it works
 
 ```
@@ -443,14 +451,6 @@ This drives the same SQLite queue: enqueue work from Claude, let the CLI worker 
 **Can I run it overnight?** Use `npm run worker` to keep the queue running while Claude Desktop is closed. It still respects working hours and caps by design; widen `workHours`/`workDays` with `pacing_set` if you really want it to work outside office hours.
 
 **Can I use Edge or Chromium instead of Chrome?** Yes: `LINKEDIN_MCP_CHROME_CHANNEL=msedge` or `chromium`. The browser must already be installed.
-
-## Roadmap
-
-- **Next version: ATS importers.** Push exported applicants, resumes and profiles into Ashby, Lever, Workable, Greenhouse and similar applicant tracking systems through their APIs, so LinkedIn applicants land in the pipeline you already use.
-- OCR for scanned/image resumes (text extraction currently covers PDF, DOCX and plain text).
-- More dashboard filters and saved views.
-- Test fixtures for the legacy (Ember) dashboard so both UI generations are covered by CI.
-- Already available: LinkedIn's own "Save to PDF" per profile (`savePdf` on the fetch tools, monthly cap enforced).
 
 ## Contributing
 
