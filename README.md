@@ -20,6 +20,27 @@ Export the applicants of your LinkedIn job posts (lists, application details, re
 
 > Automating LinkedIn is against its User Agreement. Read [Compliance and privacy](#compliance-and-privacy) before using this.
 
+## Dashboard
+
+```bash
+npm run dashboard        # → http://127.0.0.1:4173
+```
+
+A local, read-mostly web page over the same SQLite database the MCP server and worker use. It shows:
+
+- **Overview** tiles: jobs, applicants, details, resumes, profiles, applicants with an email; worker state and work-window pills; today's usage against the effective caps; auto-refresh.
+- **Jobs** table with progress meters per job: applicants listed vs the total LinkedIn reports, details, resumes and profiles fetched, list-sync state.
+- **Applicants** table with the same filters as `applicants_list` (job, full-text search, has resume / profile / details, rating), pagination, and links to the stored resume file, `profile.json` and the LinkedIn profile.
+- A **detail drawer** per applicant: contact details, screening answers, qualifications, resume text, profile.
+- **Export CSV / JSON** buttons (the only write the dashboard performs: files under `<data>/exports/`).
+- **Recent worker events** (checkpoints, rate limits, cool-downs, failures).
+
+It binds to `127.0.0.1` only, applicant data is personal information, serves GET requests only, and never touches LinkedIn. Change the port with `LINKEDIN_MCP_DASHBOARD_PORT`.
+
+![Dashboard](docs/dashboard.png)
+
+*The dashboard with sample data: overview tiles, per-job progress meters and the applicant table.*
+
 ## How it works
 
 ```
@@ -319,27 +340,6 @@ The `speed` preset scales the three caps (`slow` × 0.6, `brisk` × 1.4) and pic
 **Start slow after a new-device login.** The first sign-in to the dedicated profile looks like a new device to LinkedIn (expect an email PIN). Do not start a crawl the same evening. Begin the next work day with `jobs_sync` and a small `applicants_sync`, consider `LINKEDIN_MCP_SPEED=slow` with a gentler ramp (for example `LINKEDIN_MCP_RAMP_START=15`, `LINKEDIN_MCP_RAMP_PER_DAY=8`) for the first week, and only then move to `normal`.
 
 **Profile strategy.** Profile views are the most rate-sensitive action on LinkedIn. With `LINKEDIN_MCP_PROFILE_STRATEGY=auto` (default) the worker visits the profile page like a person and then makes one request (1–3 with top-ups for truncated sections) to LinkedIn's internal profile API from inside the page, structured data with dates, instead of ~8 page views through the detail sections, and falls back to the rendered text if that fails. `dom` never touches the API and reads the profile and detail pages as text, at the cost of more page views per applicant. `voyager` uses the API only and fails if LinkedIn retires the endpoint.
-
-## Dashboard
-
-```bash
-npm run dashboard        # → http://127.0.0.1:4173
-```
-
-A local, read-mostly web page over the same SQLite database the MCP server and worker use. It shows:
-
-- **Overview** tiles: jobs, applicants, details, resumes, profiles, applicants with an email; worker state and work-window pills; today's usage against the effective caps; auto-refresh.
-- **Jobs** table with progress meters per job: applicants listed vs the total LinkedIn reports, details, resumes and profiles fetched, list-sync state.
-- **Applicants** table with the same filters as `applicants_list` (job, full-text search, has resume / profile / details, rating), pagination, and links to the stored resume file, `profile.json` and the LinkedIn profile.
-- A **detail drawer** per applicant: contact details, screening answers, qualifications, resume text, profile.
-- **Export CSV / JSON** buttons (the only write the dashboard performs: files under `<data>/exports/`).
-- **Recent worker events** (checkpoints, rate limits, cool-downs, failures).
-
-It binds to `127.0.0.1` only, applicant data is personal information, serves GET requests only, and never touches LinkedIn. Change the port with `LINKEDIN_MCP_DASHBOARD_PORT`.
-
-![Dashboard](docs/dashboard.png)
-
-*The dashboard with sample data: overview tiles, per-job progress meters and the applicant table.*
 
 ## Data layout
 
