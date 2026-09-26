@@ -68,8 +68,13 @@ export function parseApplicantCardText(text: string): ParsedApplicantCard {
   const qualLine = lines.find((l) => /must-have|preferred|qualification|screening|meets/i.test(l) || /^\d+\/\d+\b/.test(l) || /\d+ of \d+/i.test(l));
   const rest = lines.filter((l) => l !== appliedLine && l !== qualLine);
   const nameIdx = rest.findIndex((l) => !BADGE_LINE.test(l) && l.length >= 2 && l.length <= 80);
-  const fullName = rest[nameIdx] ?? rest[0] ?? '';
-  const after = rest.slice(nameIdx + 1).filter((l) => !BADGE_LINE.test(l));
+  let fullName = rest[nameIdx] ?? rest[0] ?? '';
+  let after = rest.slice(nameIdx + 1).filter((l) => !BADGE_LINE.test(l) && l !== '--');
+  const badges = parseNameBadges(fullName);
+  if (badges) {
+    fullName = badges.name;
+    if (after[0] && after[0].localeCompare(badges.name, undefined, { sensitivity: 'base' }) === 0) after = after.slice(1);
+  }
   let headline: string | undefined;
   let location: string | undefined;
   for (const l of after) {
@@ -104,6 +109,23 @@ export interface ParsedProRow {
   appliedOn?: string;
   qualificationsText?: string;
   meetsScreening?: boolean;
+  /** LinkedIn marks applications the poster has not opened yet as "new applicant". */
+  isNew?: boolean;
+  /** The applicant shows the "Open to work" badge on their profile. */
+  openToWork?: boolean;
+}
+
+/**
+ * Cards for unopened applications start with an accessibility line that repeats the name with badges,
+ * e.g. "Jane Doe, new applicant" or "Jane Doe is open to work, new applicant", followed by the real name line.
+ * Returns the bare name plus the badges, or undefined when the line carries no badge.
+ */
+export function parseNameBadges(line: string): { name: string; isNew: boolean; openToWork: boolean } | undefined {
+  const m = /^(.*?)(\s+is open to work)?(,\s*new applicant)?\s*$/i.exec(line);
+  if (!m || (!m[2] && !m[3])) return undefined;
+  const name = m[1]!.trim();
+  if (!name) return undefined;
+  return { name, isNew: Boolean(m[3]), openToWork: Boolean(m[2]) };
 }
 
 /**
@@ -114,7 +136,17 @@ export function parseProRowText(text: string): ParsedProRow {
   const lines = cleanLines(text);
   const appliedLine = lines.find((l) => /^applied\b/i.test(l) || /\bago\b/i.test(l));
   const qualLines = lines.filter((l) => /must-have|preferred|qualification/i.test(l) || /^\d+\/\d+\b/.test(l));
-  const rest = lines.filter((l) => l !== appliedLine && !qualLines.includes(l) && !BADGE_LINE.test(l));
+  const rest = lines.filter((l) => l !== appliedLine && !qualLines.includes(l) && !BADGE_LINE.test(l) && l !== '--');
+  let isNew: boolean | undefined;
+  let openToWork: boolean | undefined;
+  const badges = rest[0] ? parseNameBadges(rest[0]) : undefined;
+  if (badges) {
+    isNew = badges.isNew || undefined;
+    openToWork = badges.openToWork || undefined;
+    rest[0] = badges.name;
+    // The badge line is followed by the plain name line; drop that duplicate.
+    if (rest[1] && rest[1].localeCompare(badges.name, undefined, { sensitivity: 'base' }) === 0) rest.splice(1, 1);
+  }
   const fullName = rest[0] ?? '';
   const after = rest.slice(1);
   let location: string | undefined;
@@ -145,7 +177,7 @@ export function parseProRowText(text: string): ParsedProRow {
   const qualificationsText = qualLines.join(' · ') || undefined;
   const mustHave = qualificationsText ? [...qualificationsText.matchAll(/(\d+)\/(\d+)[\s·]*must-have/gi)] : [];
   const meets = mustHave.length ? mustHave.every((m) => m[1] === m[2]) : undefined;
-  return { fullName, title, company, location, appliedOn: appliedLine, qualificationsText, meetsScreening: meets };
+  return { fullName, title, company, location, appliedOn: appliedLine, qualificationsText, meetsScreening: meets, isNew, openToWork };
 }
 
 /** "Applied on: Sep 20, 2026" | "Applied 3 days ago" | "2 weeks ago" → ISO */
@@ -730,8 +762,9 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
         location: parsed.location,
         appliedAt: parseAppliedOn(parsed.appliedOn),
         profileUrl: normalizeProfileUrl(r.profileHref),
+        isViewed: parsed.isNew ? false : undefined,
         listSyncedAt: now,
-        raw: { rowText: r.text, qualifications: parsed.qualificationsText, meetsScreening: parsed.meetsScreening, listPage: current },
+        raw: { rowText: r.text, qualifications: parsed.qualificationsText, meetsScreening: parsed.meetsScreening, openToWork: parsed.openToWork, listPage: current },
       };
       db.upsertApplicantFromList(a);
       st.collected.push(a);

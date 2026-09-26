@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideNextPage, parseAppliedOn, parseApplicantCardText, parseProRowText } from '../src/linkedin/applicants.js';
+import { decideNextPage, parseAppliedOn, parseApplicantCardText, parseNameBadges, parseProRowText } from '../src/linkedin/applicants.js';
 
 describe('parseApplicantCardText (legacy)', () => {
   it('parses a legacy-style card', () => {
@@ -34,6 +34,66 @@ describe('parseProRowText (Hiring Pro)', () => {
   it('splits "Title at Company" and ignores badges', () => {
     const p = parseProRowText('Top fit\nJohn Smith\nData Scientist at Globex\nIstanbul, Türkiye\n1/3 Must-have\nApplied 2 days ago');
     expect(p).toMatchObject({ fullName: 'John Smith', title: 'Data Scientist', company: 'Globex', location: 'Istanbul, Türkiye', meetsScreening: false });
+  });
+});
+
+describe('parseNameBadges', () => {
+  it('extracts the name and badges from the accessibility line', () => {
+    expect(parseNameBadges('Dana Whitfield, new applicant')).toEqual({ name: 'Dana Whitfield', isNew: true, openToWork: false });
+    expect(parseNameBadges('Dana Whitfield is open to work, new applicant')).toEqual({ name: 'Dana Whitfield', isNew: true, openToWork: true });
+    expect(parseNameBadges('Dana Whitfield is open to work')).toEqual({ name: 'Dana Whitfield', isNew: false, openToWork: true });
+  });
+
+  it('leaves plain names alone', () => {
+    expect(parseNameBadges('Dana Whitfield')).toBeUndefined();
+    expect(parseNameBadges('Dr. Erika N.')).toBeUndefined();
+    expect(parseNameBadges(', new applicant')).toBeUndefined();
+  });
+});
+
+describe('parseProRowText (unopened applications)', () => {
+  it('drops the "new applicant" badge line and keeps the real headline', () => {
+    const p = parseProRowText('Dana Whitfield, new applicant\nDana Whitfield\n\nHead of Operations | Scaling logistics platforms\n\nSan Francisco Bay Area\n\n4/6\n\nMust-have\n\n5/5\n\nPreferred');
+    expect(p.fullName).toBe('Dana Whitfield');
+    expect(p.title).toBe('Head of Operations | Scaling logistics platforms');
+    expect(p.company).toBeUndefined();
+    expect(p.location).toBe('San Francisco Bay Area');
+    expect(p.isNew).toBe(true);
+    expect(p.openToWork).toBeUndefined();
+  });
+
+  it('handles "is open to work" and an empty "--" headline', () => {
+    const p = parseProRowText('Priya Raman is open to work, new applicant\nPriya Raman\n\n--\n\nAustin, Texas, United States\n\n1/6\n\nMust-have\n\n2/5\n\nPreferred');
+    expect(p.fullName).toBe('Priya Raman');
+    expect(p.title).toBeUndefined();
+    expect(p.company).toBeUndefined();
+    expect(p.location).toBe('Austin, Texas, United States');
+    expect(p.isNew).toBe(true);
+    expect(p.openToWork).toBe(true);
+  });
+
+  it('still splits a real "Title at Company" headline after the badge line', () => {
+    const p = parseProRowText('Priya Raman is open to work, new applicant\nPriya Raman\n\nRetail Sales Assistant at Acme Robotics\n\nToronto, Ontario, Canada\n\n1/6\n\nMust-have\n\n2/5\n\nPreferred');
+    expect(p.fullName).toBe('Priya Raman');
+    expect(p.title).toBe('Retail Sales Assistant');
+    expect(p.company).toBe('Acme Robotics');
+    expect(p.location).toBe('Toronto, Ontario, Canada');
+  });
+
+  it('keeps the badge line when the name line is missing', () => {
+    const p = parseProRowText('Dana Whitfield, new applicant\n\nCOO\n\nUnited States');
+    expect(p.fullName).toBe('Dana Whitfield');
+    expect(p.title).toBe('COO');
+    expect(p.location).toBe('United States');
+  });
+});
+
+describe('parseApplicantCardText (unopened applications)', () => {
+  it('drops the badge line on legacy cards too', () => {
+    const p = parseApplicantCardText('Dana Whitfield, new applicant\nDana Whitfield\nHead of Operations at Acme Robotics\nToronto, Ontario, Canada\nApplied 3 days ago');
+    expect(p.fullName).toBe('Dana Whitfield');
+    expect(p.headline).toBe('Head of Operations at Acme Robotics');
+    expect(p.location).toBe('Toronto, Ontario, Canada');
   });
 });
 

@@ -433,6 +433,29 @@ export class Db {
     this.refreshFts(applicationId);
   }
 
+  /** Stored list rows with their raw card text, for offline re-parsing after a parser fix. */
+  rawApplicantRows(jobId?: string): Row[] {
+    const sql = 'SELECT application_id, full_name, headline, location, applied_at, is_viewed, detail_fetched_at, raw FROM applicants' + (jobId ? ' WHERE job_id = ?' : '');
+    return (jobId ? this.prep(sql).all(jobId) : this.prep(sql).all()) as Row[];
+  }
+
+  /** Apply the result of re-parsing a stored list row (name, headline, location, applied date, viewed flag, raw). */
+  applyReparsedRow(
+    applicationId: string,
+    r: { fullName: string; headline: string | null; location: string | null; appliedAt: string | null; isViewed: number | null; raw: unknown },
+  ): void {
+    this.prep('UPDATE applicants SET full_name = ?, headline = ?, location = ?, applied_at = ?, is_viewed = ?, raw = ? WHERE application_id = ?').run(
+      r.fullName,
+      r.headline,
+      r.location,
+      r.appliedAt,
+      r.isViewed,
+      j(r.raw),
+      applicationId,
+    );
+    this.refreshFts(applicationId);
+  }
+
   /** Undo ratings assigned from list buckets during a run whose bucket parameter turned out to be ignored. */
   clearListRatings(jobId: string, sinceIso: string): number {
     const r = this.prep('UPDATE applicants SET rating = NULL WHERE job_id = ? AND detail_fetched_at IS NULL AND list_synced_at >= ?').run(jobId, sinceIso);

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { delaysForSpeed, loadConfig, type Config } from './config.js';
 import { createLogger } from './log.js';
 import { Db } from './storage/db.js';
+import { reparseIfParserChanged } from './storage/reparse.js';
 import { BrowserSession } from './browser/session.js';
 import { Scheduler } from './queue/scheduler.js';
 import { SETTINGS, Worker } from './queue/worker.js';
@@ -30,6 +31,8 @@ export function bootstrap(opts: { ownerKind: 'mcp' | 'cli'; cfg?: Config }): Dep
   const db = new Db(cfg.dbPath);
   const stale = db.resetStaleRunning();
   if (stale) log.warn('reset stale running tasks from a previous process', { count: stale });
+  const reparsed = reparseIfParserChanged(db);
+  if (reparsed?.changed) log.info('re-parsed stored applicant rows with the current parser', { ...reparsed });
 
   const getPacing = (): PacingSettings => mergePacing(cfg.pacingDefaults, db.getSetting<Partial<PacingSettings>>(SETTINGS.pacing));
   // Other processes (dashboard, CLI worker started without the MCP env) read the effective pacing from here.

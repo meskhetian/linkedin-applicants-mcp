@@ -8,6 +8,18 @@ changes; they are called out explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- Applicant names no longer carry LinkedIn's badge text ("Jane Doe, new applicant", "Jane Doe is open to work"),
+  and the headline of those rows is no longer "Jane Doe at <headline>". The badge now sets the viewed flag
+  (unopened applications) and an `openToWork` marker in the raw row data. Rows stored by earlier versions are
+  re-parsed automatically the first time the server, worker or dashboard starts.
+
+### Added
+
+- `npm run reparse [jobId]` re-runs the current parsers over the raw card text kept with every stored row,
+  without touching LinkedIn.
+
 ## [0.1.0] - 2026-09-26
 
 Initial public release.
