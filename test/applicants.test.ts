@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideNextPage, fitPriorityBonus, nextSweepSort, parseApplicantCardText, parseAppliedOn, parseFitScore, parseNameBadges, parseProRowText } from '../src/linkedin/applicants.js';
+import { decideNextPage, fitPriorityBonus, parseApplicantCardText, parseAppliedOn, parseAppliedOnDate, parseFitScore, parseNameBadges, parseProRowText, parseTableRowText, ratingFromTableLabel, shouldSweepList } from '../src/linkedin/applicants.js';
 
 describe('parseApplicantCardText (legacy)', () => {
   it('parses a legacy-style card', () => {
@@ -167,18 +167,37 @@ describe('fit score from the list counters', () => {
   });
 });
 
-describe('nextSweepSort', () => {
+
+describe('shouldSweepList', () => {
   const base = { jobId: 'j', nextOffset: 1000, pagesVisited: 41, totalReported: 1005, stored: 955, complete: true, stoppedEarly: true } as const;
-  it('queues a sweep in another order when a complete list is more than 2% short', () => {
-    expect(nextSweepSort({ ...base }, false)).toBe('LastName');
-    expect(nextSweepSort({ ...base, sweeps: 1 }, true)).toBe('QualificationMatch');
-    expect(nextSweepSort({ ...base, sweeps: 2 }, true)).toBeUndefined();
+  it('sweeps once when a complete list is more than 2% short', () => {
+    expect(shouldSweepList({ ...base }, false)).toBe(true);
+    expect(shouldSweepList({ ...base, sweeps: 1 }, false)).toBe(false);
+    expect(shouldSweepList({ ...base }, true)).toBe(false);
   });
   it('does not sweep lists that are close enough, incomplete, or without a total', () => {
-    expect(nextSweepSort({ ...base, stored: 990 }, false)).toBeUndefined();
-    expect(nextSweepSort({ ...base, complete: false }, false)).toBeUndefined();
-    expect(nextSweepSort({ ...base, totalReported: undefined }, false)).toBeUndefined();
-    // A sweep that did not register as a sweep must not queue itself again.
-    expect(nextSweepSort({ ...base, sweeps: 0 }, true)).toBeUndefined();
+    expect(shouldSweepList({ ...base, stored: 990 }, false)).toBe(false);
+    expect(shouldSweepList({ ...base, complete: false }, false)).toBe(false);
+    expect(shouldSweepList({ ...base, totalReported: undefined }, false)).toBe(false);
+  });
+});
+
+describe('table view rows', () => {
+  it('parses a full row and a row without title or company', () => {
+    const full = parseTableRowText('Dana Whitfield\n\nApplied on: 9/19/2026\n\nChief of Staff & Head of Business Operations\n\nAcme Robotics\n\nSan Francisco Bay Area\n\n4/6\n\nMust-have\n\n5/5\n\nPreferred\n\nNot a fit')!;
+    expect(full).toMatchObject({ fullName: 'Dana Whitfield', appliedOn: 'Applied on: 9/19/2026', title: 'Chief of Staff & Head of Business Operations', company: 'Acme Robotics', location: 'San Francisco Bay Area', ratingLabel: 'Not a fit' });
+    expect(full.qualificationsText).toBe('4/6 · Must-have · 5/5 · Preferred');
+    const bare = parseTableRowText('Priya Raman\n\nApplied on: 9/19/2026\n\nToronto, Ontario, Canada\n\n4/6\n\nMust-have\n\n4/5\n\nPreferred\n\nTop fit')!;
+    expect(bare).toMatchObject({ fullName: 'Priya Raman', location: 'Toronto, Ontario, Canada', ratingLabel: 'Top fit' });
+    expect(bare.title).toBeUndefined();
+    expect(parseTableRowText('Sort by: Date applied (Newest first)')).toBeUndefined();
+  });
+
+  it('maps table labels and dates', () => {
+    expect(ratingFromTableLabel('Not a fit')).toBe('not_a_fit');
+    expect(ratingFromTableLabel('Maybe')).toBe('maybe');
+    expect(ratingFromTableLabel('Top fit')).toBeUndefined();
+    expect(parseAppliedOnDate('Applied on: 9/19/2026')).toBe('2026-09-19T00:00:00.000Z');
+    expect(parseAppliedOnDate('yesterday')).toBeUndefined();
   });
 });

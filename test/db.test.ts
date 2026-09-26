@@ -115,3 +115,12 @@ describe('cancelling a running task', () => {
     expect(db.taskStatus(id)).toBe('cancelled');
   });
 });
+
+describe('applicantIdsByName', () => {
+  it('matches stored names case-insensitively within a job', () => {
+    const db = seed();
+    expect(db.applicantIdsByName('j1', 'ada lovelace')).toEqual(['a1']);
+    expect(db.applicantIdsByName('j1', 'Nobody Here')).toEqual([]);
+    expect(db.applicantIdsByName('other', 'Ada Lovelace')).toEqual([]);
+  });
+});

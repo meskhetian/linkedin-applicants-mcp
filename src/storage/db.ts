@@ -535,6 +535,12 @@ export class Db {
     for (const r of rows) yield rowToApplicant(r, true);
   }
 
+  /** Application ids of applicants of a job whose stored name equals `fullName` (case-insensitive). */
+  applicantIdsByName(jobId: string, fullName: string): string[] {
+    const rows = this.prep('SELECT application_id FROM applicants WHERE job_id = ? AND lower(full_name) = lower(?)').all(jobId, fullName.trim()) as Row[];
+    return rows.map((r) => String(r.application_id));
+  }
+
   countApplicants(jobId?: string): number {
     const r = (jobId
       ? this.prep('SELECT COUNT(*) AS c FROM applicants WHERE job_id = ?').get(jobId)

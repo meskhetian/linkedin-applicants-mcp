@@ -304,6 +304,7 @@ export async function syncApplicantList(ctx: ScrapeContext, jobId: string, opts:
     log.info('applicant list UI detected', { jobId, variant, url: page.url() });
   }
   const state: CrawlState = { jobId, progress, runStart: new Date().toISOString(), seen: new Set(), collected: [], pagesThisRun: 0, rawDir: path.join(jobDir(ctx.cfg, jobId), 'raw') };
+  if (opts.sweep && variant === 'hiring_pro') return sweepHiringProTable(ctx, state, opts);
   return variant === 'hiring_pro' ? crawlHiringPro(ctx, state, opts) : crawlLegacy(ctx, state, opts);
 }
 
@@ -877,16 +878,182 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
 }
 
 /**
- * LinkedIn's date order shifts between page loads, so a first pass typically ends a few percent short of the
- * reported total (duplicates on one page displace applicants that never render). One or two sweeps in another
- * order recover most of them. Returns the order for the next sweep, or undefined when none is due.
+ * The list view's order (qualification match) has many ties and shifts between page loads, so a first pass ends a
+ * few percent short of the reported total: duplicates on one page displace applicants that never render. One sweep
+ * through the table view in date order (stable, honoured by LinkedIn) finds the rows the list never showed.
  */
-export function nextSweepSort(progress: ApplicantSyncProgress | undefined, currentTaskIsSweep: boolean): ApplicantListSort | undefined {
-  if (!progress?.complete || !progress.totalReported) return undefined;
-  if (progress.stored >= progress.totalReported * 0.98) return undefined;
-  const sweeps = progress.sweeps ?? 0;
-  const order: ApplicantListSort[] = ['LastName', 'QualificationMatch'];
-  if (sweeps >= order.length) return undefined;
-  if (currentTaskIsSweep && sweeps === 0) return undefined; // the sweep itself did not register: do not loop
-  return order[sweeps];
+export function shouldSweepList(progress: ApplicantSyncProgress | undefined, currentTaskIsSweep: boolean): boolean {
+  if (!progress?.complete || !progress.totalReported) return false;
+  if (progress.stored >= progress.totalReported * 0.98) return false;
+  if (currentTaskIsSweep) return false; // one sweep per list; whatever is left is not shown by LinkedIn
+  return (progress.sweeps ?? 0) < 1;
+}
+
+export const TABLE_PAGE_SIZE = 30;
+
+export interface ParsedTableRow {
+  fullName: string;
+  appliedOn?: string;
+  title?: string;
+  company?: string;
+  location?: string;
+  qualificationsText?: string;
+  /** LinkedIn's label in the last column: "Top fit", "Maybe", "Not a fit" */
+  ratingLabel?: string;
+}
+
+/** A row of the Hiring Pro table view: "Name / Applied on: 9/19/2026 / Title / Company / Location / 4/6 Must-have 5/5 Preferred / Not a fit". */
+export function parseTableRowText(text: string): ParsedTableRow | undefined {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  if (lines.length < 2 || !lines.some((l) => /^applied on:/i.test(l))) return undefined;
+  const fullName = lines[0]!;
+  const appliedOn = lines.find((l) => /^applied on:/i.test(l));
+  const qual = lines.filter((l) => /^\d+\/\d+$/.test(l) || /^(must-have|preferred)$/i.test(l));
+  let ratingLabel: string | undefined;
+  const last = lines[lines.length - 1]!;
+  if (/^(top fit|good fit|strong fit|maybe|not a fit|unrated|not rated)$/i.test(last)) ratingLabel = last;
+  const rest = lines.slice(1).filter((l) => l !== appliedOn && !qual.includes(l) && l !== ratingLabel);
+  let location: string | undefined;
+  if (rest.length && (LOCATION_LIKE.test(rest[rest.length - 1]!) || /\b(area|united states|united kingdom|remote)\b/i.test(rest[rest.length - 1]!))) location = rest.pop();
+  const title = rest[0];
+  const company = rest[1];
+  return { fullName, appliedOn, title, company, location, qualificationsText: qual.join(' · ') || undefined, ratingLabel };
+}
+
+/** LinkedIn's table label → stored rating; "Top fit" is a match label, not a recruiter rating. */
+export function ratingFromTableLabel(label: string | undefined): ApplicantRating | undefined {
+  if (!label) return undefined;
+  const l = label.toLowerCase();
+  if (l === 'good fit') return 'good_fit';
+  if (l === 'maybe') return 'maybe';
+  if (l === 'not a fit') return 'not_a_fit';
+  return undefined;
+}
+
+/** "Applied on: 9/19/2026" (US order) → ISO date. */
+export function parseAppliedOnDate(text: string | undefined): string | undefined {
+  const m = text ? /(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(text) : null;
+  if (!m) return undefined;
+  const d = new Date(Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2])));
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
+interface TableRowOnPage extends ParsedTableRow {
+  index: number;
+}
+
+const TABLE_ROW_SELECTOR = 'main [role="button"], main [tabindex="0"]';
+
+async function collectTableRows(page: Page): Promise<TableRowOnPage[]> {
+  const texts = await page
+    .evaluate((sel) => Array.from(document.querySelectorAll(sel)).map((e) => ((e as HTMLElement).innerText ?? '').trim()), TABLE_ROW_SELECTOR)
+    .catch(() => [] as string[]);
+  const out: TableRowOnPage[] = [];
+  texts.forEach((t, index) => {
+    if (!/applied on:/i.test(t)) return;
+    const parsed = parseTableRowText(t);
+    if (parsed) out.push({ ...parsed, index });
+  });
+  return out;
+}
+
+/**
+ * Second pass over a complete list through the table view (30 rows per page, date order, honoured by LinkedIn).
+ * Rows carry no ids, so each row is matched to the stored applicants by name; a row nobody matches is opened
+ * with a click, which reveals its application id in the URL, and stored as a list row. Chunked like the list
+ * crawl (`maxPages` pages per run, resume with `startOffset`).
+ */
+async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: SyncApplicantsOptions): Promise<SyncApplicantsResult> {
+  const { page, human, db, log } = ctx;
+  const { jobId, progress } = st;
+  const totalReported = progress?.totalReported;
+  let offset = opts.startOffset ?? 0;
+  let recovered = 0;
+  const result = (complete: boolean): SyncApplicantsResult => ({
+    jobId,
+    applicants: st.collected,
+    totalReported,
+    pagesVisited: st.pagesThisRun,
+    nextOffset: complete ? undefined : offset,
+    complete,
+    paginationMode: 'offset',
+    uiVariant: 'hiring_pro',
+  });
+  const persist = (done: boolean) => {
+    db.setSyncProgress({
+      ...(progress ?? { jobId, nextOffset: 0, pagesVisited: 0, stored: 0, complete: true }),
+      jobId,
+      stored: db.countApplicants(jobId),
+      complete: true,
+      sweeps: (progress?.sweeps ?? 0) + (done ? 1 : 0) || undefined,
+      lastRunAt: new Date().toISOString(),
+    });
+  };
+  const tableUrl = (start: number) => `${URLS.applicantsProTable(jobId, 'DateApplied')}${start > 0 ? `&start=${start}` : ''}`;
+
+  for (;;) {
+    await human.goto(page, tableUrl(offset));
+    await ctx.assertHealthy();
+    await human.pause('read');
+    let rows = await collectTableRows(page);
+    if (!rows.length) {
+      await human.pauseMs(4000, 8000);
+      rows = await collectTableRows(page);
+    }
+    st.pagesThisRun++;
+    const now = new Date().toISOString();
+    const missing = rows.filter((r) => db.applicantIdsByName(jobId, r.fullName).length === 0);
+    log.info('table sweep page read', { jobId, offset, rows: rows.length, missing: missing.length });
+    opts.onPage?.([], st.pagesThisRun - 1, offset + TABLE_PAGE_SIZE);
+    for (const row of missing) {
+      // Open the row to learn its application id, store it, and come back to the same table page.
+      const rowLoc = page.locator(TABLE_ROW_SELECTOR).nth(row.index);
+      try {
+        await human.pause('short');
+        await human.click(page, rowLoc);
+        await page.waitForURL(/applicationId=\d+/, { timeout: 20_000 });
+        await ctx.assertHealthy();
+        const applicationId = parseApplicationId(page.url());
+        if (applicationId) {
+          const a: Applicant = {
+            applicationId,
+            jobId,
+            fullName: row.fullName,
+            headline: [row.title, row.company].filter(Boolean).join(' at ') || undefined,
+            location: row.location,
+            appliedAt: parseAppliedOnDate(row.appliedOn),
+            rating: ratingFromTableLabel(row.ratingLabel),
+            listSyncedAt: now,
+            raw: { source: 'table-sweep', rowText: `${row.fullName}\n${row.appliedOn ?? ''}`, qualifications: row.qualificationsText, fitLabel: row.ratingLabel, tableOffset: offset },
+          };
+          db.upsertApplicantFromList(a);
+          st.collected.push(a);
+          recovered++;
+          log.info('table sweep recovered an applicant the list never showed', { jobId, applicationId, offset });
+        }
+        await human.pause('betweenApplicants');
+        await human.goto(page, tableUrl(offset));
+        await ctx.assertHealthy();
+        await human.pause('read');
+      } catch (e) {
+        log.warn('table sweep could not open a row', { jobId, offset, error: errorMessage(e) });
+        await human.goto(page, tableUrl(offset)).catch(() => {});
+      }
+    }
+    const done = rows.length < TABLE_PAGE_SIZE || (totalReported !== undefined && offset + TABLE_PAGE_SIZE >= totalReported);
+    offset += TABLE_PAGE_SIZE;
+    if (done) {
+      persist(true);
+      log.info('table sweep complete', { jobId, recoveredThisRun: recovered, stored: db.countApplicants(jobId), totalReported });
+      return result(true);
+    }
+    if (opts.maxPages !== undefined && st.pagesThisRun >= opts.maxPages) {
+      persist(false);
+      return result(false);
+    }
+    await human.pause('betweenPages');
+  }
 }
