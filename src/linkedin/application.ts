@@ -174,9 +174,18 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     const more = (await firstVisible(root, SEL[gen].detail.contactButton, { timeoutMs: 1200 })) ?? (await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 1000 }));
     if (more) {
       try {
+        const bodyBefore = await page.evaluate(() => document.body.innerText).catch(() => '');
         await human.click(page, more);
         await human.pause('short');
         for (const it of await allOfFirst(page, SEL[gen].detail.contactItems)) contactText += `${(await textOf(it)) ?? ''}\n`;
+        // Popovers without ARIA roles: whatever text appeared after the click is the contact card.
+        const bodyAfter = await page.evaluate(() => document.body.innerText).catch(() => '');
+        const seen = new Set(bodyBefore.split('\n').map((l) => l.trim()));
+        const appeared = bodyAfter
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => l && !seen.has(l));
+        if (appeared.length) contactText += `${appeared.join('\n')}\n`;
         const popover = await page
           .evaluate(() => {
             const roots = Array.from(document.querySelectorAll('[role="menu"], [role="dialog"], [role="tooltip"], .artdeco-dropdown__content'));
@@ -197,6 +206,9 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
       }
     }
   }
+
+  // Qualifications (Hiring Pro): must-have / preferred statements and the applicant's match
+  const qualificationsText = extractQualificationsText(text);
 
   // Screening questions
   const screeningSection = await firstVisible(root, SEL[gen].detail.screeningSection, { timeoutMs: 800 });
@@ -221,6 +233,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     links,
     contactText,
     screeningText,
+    qualificationsText,
     resume,
     captured: ctx.capture
       .since(mark)
@@ -245,23 +258,61 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     hasResume: resume.hasResume,
     resumePath: resume.path,
     resumeFileName: resume.fileName,
-    extra: { rawTextChars: text.length, resumeStrategy: resume.strategy, resumeHost: resume.host, generation: gen, uiVariant: variant, appliedAgo },
+    extra: { rawTextChars: text.length, resumeStrategy: resume.strategy, resumeHost: resume.host, generation: gen, uiVariant: variant, appliedAgo, qualificationsText, resumeDebug: resume.debug },
     raw: { headerText: text.slice(0, 1500) },
   };
 }
 
-/** Innermost block that contains both the applicant's profile link and the Resume control = the Hiring Pro detail pane. */
+/**
+ * The Hiring Pro detail pane: the innermost block that spans from the applicant header (profile link, "Applied …",
+ * Resume control) down to the "View full profile" link at the bottom, so it includes the Contact button, the
+ * Qualifications section and the experience summary. Header-only blocks are used only as a last resort.
+ */
 async function locateProDetailPane(page: Page): Promise<Locator | null> {
-  for (const sel of ['div:has(a[href*="/in/"]):has(:text-is("Resume"))', 'div:has(a[href*="/in/"]):has(:text-matches("^Applied", "i"))', 'div:has(a:has-text("View full profile"))']) {
+  const selectors = [
+    'div:has(a[href*="/in/"]):has(a:has-text("View full profile")):has(:text-matches("^Applied", "i"))',
+    'div:has(a[href*="/in/"]):has(a:has-text("View full profile")):has(:text-is("Resume"))',
+    'div:has(a:has-text("View full profile")):has(:text-matches("^Applied", "i"))',
+    'div:has(a[href*="/in/"]):has(:text-is("Resume"))',
+    'div:has(a[href*="/in/"]):has(:text-matches("^Applied", "i"))',
+    'div:has(a:has-text("View full profile"))',
+  ];
+  let fallback: Locator | null = null;
+  for (const sel of selectors) {
     try {
       const loc = page.locator(sel);
       const n = await loc.count();
-      if (n) return loc.nth(n - 1);
+      if (!n) continue;
+      const candidate = loc.nth(n - 1);
+      const len = ((await candidate.innerText({ timeout: 1500 }).catch(() => '')) ?? '').length;
+      // A real pane carries the header plus the qualification / experience summary; a bare header is ~200 chars.
+      if (len >= 400) return candidate;
+      fallback ??= candidate;
     } catch {
       /* selector engine mismatch */
     }
   }
-  return null;
+  return fallback;
+}
+
+/** Text between the first line matching `start` and the next line matching `end` (clipped), e.g. the Qualifications section. */
+export function sliceBetween(text: string, start: RegExp, end: RegExp, maxChars = 6000): string | undefined {
+  const lines = text.split(/\r?\n/).map((l) => l.replace(/\s+/g, ' ').trim());
+  const from = lines.findIndex((l) => start.test(l));
+  if (from < 0) return undefined;
+  let to = lines.findIndex((l, i) => i > from && end.test(l));
+  if (to < 0) to = lines.length;
+  const out = lines
+    .slice(from, to)
+    .filter((l, i, arr) => l && arr[i - 1] !== l)
+    .join('\n')
+    .trim();
+  return out ? out.slice(0, maxChars) : undefined;
+}
+
+/** Hiring Pro shows the job's must-have / preferred qualifications and how the applicant scores against them. */
+export function extractQualificationsText(paneText: string): string | undefined {
+  return sliceBetween(paneText, /^qualifications$/i, /^(rate this ai-generated content|experience|education|about|skills)$/i);
 }
 
 function cleanName(n: string | undefined): string | undefined {
@@ -318,6 +369,34 @@ interface ResumeOutcome {
   strategy: 'attachment' | 'viewer' | 'download' | 'popup' | 'none';
   hasResume: boolean;
   host?: string;
+  /** What the page looked like after the Resume control was used, when no file could be retrieved. */
+  debug?: Record<string, unknown>;
+}
+
+/** Snapshot of viewer-ish state (tabs, dialogs, frames, file-like URLs the page fetched) for offline debugging. */
+async function resumeDebugInfo(ctx: ScrapeContext, mark: number): Promise<Record<string, unknown>> {
+  const { page } = ctx;
+  const dom = await page
+    .evaluate(() => {
+      const q = (sel: string) => Array.from(document.querySelectorAll(sel));
+      return {
+        dialogs: q('[role="dialog"], dialog').map((d) => ((d as HTMLElement).innerText ?? '').slice(0, 800)),
+        frames: q('iframe[src], embed[src], object[data]').map((e) => e.getAttribute('src') ?? e.getAttribute('data') ?? ''),
+        downloadish: q('a[download], a[href*=".pdf"], a[href*="ambry"], a[href*="/dms/"], a[href*="mediaauth"]').map((a) => (a as HTMLAnchorElement).href),
+        buttons: q('[role="dialog"] button, dialog button').map((b) => ((b as HTMLElement).innerText || b.getAttribute('aria-label') || '').trim()).filter(Boolean).slice(0, 30),
+      };
+    })
+    .catch(() => ({ dialogs: [], frames: [], downloadish: [], buttons: [] }));
+  const tabs = page
+    .context()
+    .pages()
+    .map((p) => p.url().slice(0, 200));
+  const fetched = ctx.capture
+    .since(mark)
+    .filter((e) => /pdf|ambry|\/dms\/|mediaauth|resume|document/i.test(`${e.url} ${e.contentType}`))
+    .map((e) => ({ url: e.url.slice(0, 200), status: e.status, contentType: e.contentType }))
+    .slice(0, 20);
+  return { url: page.url(), tabs, ...dom, fetched };
 }
 
 interface Saved {
@@ -334,6 +413,7 @@ interface Saved {
  */
 async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator | Page, links: Array<{ href: string; text: string }>, saveDir: string): Promise<ResumeOutcome> {
   const { page, human, log } = ctx;
+  const mark = ctx.capture.mark();
   const closeViewer = async () => {
     const d = await firstVisible(page, SEL[gen].detail.dismiss, { timeoutMs: 800 });
     if (d) await human.click(page, d, { noScroll: true }).catch(() => {});
@@ -418,13 +498,15 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
   const dlBtn = await firstVisible(page, SEL[gen].detail.downloadButton, { timeoutMs: 2000 });
   if (dlBtn) {
     const got = await clickAndCapture(ctx, dlBtn, saveDir, 45_000, true);
-    await closeViewer();
-    if (got) return { ...got, hasResume: true };
-  } else {
-    await closeViewer();
+    if (got) {
+      await closeViewer();
+      return { ...got, hasResume: true };
+    }
   }
-  log.warn('resume control found but no file could be retrieved', { url: page.url(), viewerUrl: url });
-  return { strategy: 'none', hasResume: true };
+  const debug = await resumeDebugInfo(ctx, mark);
+  await closeViewer();
+  log.warn('resume control found but no file could be retrieved', { url: page.url(), viewerUrl: url, tabs: debug.tabs, frames: debug.frames, fetched: debug.fetched });
+  return { strategy: 'none', hasResume: true, debug };
 }
 
 /**

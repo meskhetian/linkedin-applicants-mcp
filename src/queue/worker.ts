@@ -234,6 +234,11 @@ export class Worker {
 
   // ---------------- internals ----------------
 
+  /** Another live process currently drives the queue (and therefore the Chrome profile), if any. */
+  externalOwner(): OwnerLock | undefined {
+    return this.otherLiveOwner();
+  }
+
   private otherLiveOwner(): OwnerLock | undefined {
     const lock = this.deps.db.getSetting<OwnerLock>(SETTINGS.ownerLock);
     if (!lock || lock.pid === process.pid) return undefined;

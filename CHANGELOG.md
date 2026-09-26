@@ -10,6 +10,13 @@ changes; they are called out explicitly.
 
 ### Fixed
 
+- Hiring Pro application details: the detail pane is now isolated as the whole block from the applicant header
+  down to "View full profile" instead of the header card alone, so the Contact button, the Qualifications section
+  and the experience summary are read. Contact popovers without ARIA roles are captured by diffing the page text,
+  the Qualifications section is stored with the application, and a failed resume download records what the page
+  showed (tabs, dialogs, frames, file-like requests) for offline debugging.
+- Debug tools refuse to launch Chrome while another process owns the queue, because two Chromes on one profile
+  close each other.
 - Applicant names no longer carry LinkedIn's badge text ("Jane Doe, new applicant", "Jane Doe is open to work"),
   and the headline of those rows is no longer "Jane Doe at <headline>". The badge now sets the viewed flag
   (unopened applications) and an `openToWork` marker in the raw row data. Rows stored by earlier versions are

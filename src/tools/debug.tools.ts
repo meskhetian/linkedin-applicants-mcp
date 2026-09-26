@@ -13,7 +13,20 @@ import { clip, fail, guard, ok } from './result.js';
  * and try selectors. They operate on the same single tab the worker uses, pause the queue first.
  */
 export function registerDebugTools(server: McpServer, deps: Deps): void {
-  const { session, cfg } = deps;
+  const { session, cfg, worker } = deps;
+
+  /** Two Chromes on one profile close each other: refuse to launch while another process owns the queue. */
+  const ensurePage = async () => {
+    if (!session.isConnected()) {
+      const other = worker.externalOwner();
+      if (other) {
+        throw new Error(
+          `Another process (pid ${other.pid}, ${other.kind}) is driving the browser right now. Stop it first (Ctrl-C on "npm run worker", or browser_close in the client that runs the queue), then retry.`,
+        );
+      }
+    }
+    return session.ensure();
+  };
 
   server.registerTool(
     'debug_snapshot',
@@ -24,7 +37,7 @@ export function registerDebugTools(server: McpServer, deps: Deps): void {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     guard(async ({ name }) => {
-      const page = await session.ensure();
+      const page = await ensurePage();
       const dir = path.join(cfg.debugDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeName(name ?? 'snapshot')}`);
       fs.mkdirSync(dir, { recursive: true });
       const out: Record<string, string> = { dir, url: page.url() };
@@ -53,7 +66,7 @@ export function registerDebugTools(server: McpServer, deps: Deps): void {
     },
     guard(async ({ url }) => {
       if (!isLinkedInUrl(url)) return fail(new Error('Only linkedin.com URLs are allowed'));
-      const page = await session.ensure();
+      const page = await ensurePage();
       await session.human.goto(page, url);
       const checkpoint = await session.detectCheckpoint(page);
       return ok({ url: page.url(), title: await page.title().catch(() => ''), checkpoint });
@@ -69,7 +82,7 @@ export function registerDebugTools(server: McpServer, deps: Deps): void {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     guard(async ({ maxChars }) => {
-      const page = await session.ensure();
+      const page = await ensurePage();
       return ok({ url: page.url(), ...clip(await mainText(page), maxChars) });
     }),
   );
@@ -83,7 +96,7 @@ export function registerDebugTools(server: McpServer, deps: Deps): void {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     guard(async ({ selector, limit }) => {
-      const page = await session.ensure();
+      const page = await ensurePage();
       const loc = page.locator(selector);
       const count = await loc.count();
       const items: Array<Record<string, unknown>> = [];
@@ -118,7 +131,7 @@ export function registerDebugTools(server: McpServer, deps: Deps): void {
     },
     guard(async ({ selector, waitMs }) => {
       if (/shortlist|move to|rate|message|reject|hire|good fit|not a fit|maybe/i.test(selector)) return fail(new Error('Refusing: that selector looks like a write action on an applicant.'));
-      const page = await session.ensure();
+      const page = await ensurePage();
       const loc = page.locator(selector);
       const count = await loc.count();
       if (!count) return fail(new Error(`No element matches ${selector}`));

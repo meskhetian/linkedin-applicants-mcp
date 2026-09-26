@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filenameFromContentDisposition, parseDetailHeaderText, parseScreeningText, pickResumeExt, sniffExt } from '../src/linkedin/application.js';
+import { extractQualificationsText, filenameFromContentDisposition, parseDetailHeaderText, parseScreeningText, pickResumeExt, sliceBetween, sniffExt } from '../src/linkedin/application.js';
 
 describe('filenameFromContentDisposition', () => {
   it('handles plain, quoted and RFC 5987 forms', () => {
@@ -42,5 +42,28 @@ describe('parseDetailHeaderText', () => {
   it('extracts header fields from a detail page', () => {
     const h = parseDetailHeaderText('Applicants\nJane Doe\nJane Doe · 2nd\nSenior Backend Engineer at Acme\nBerlin, Germany\nApplied 3 days ago\nMessage\nGood fit\nMaybe\nNot a fit\nMore');
     expect(h).toMatchObject({ fullName: 'Jane Doe', headline: 'Senior Backend Engineer at Acme', location: 'Berlin, Germany', appliedAgo: 'Applied 3 days ago' });
+  });
+});
+
+describe('extractQualificationsText (Hiring Pro pane)', () => {
+  const pane = [
+    'Dana Whitfield', '· 2nd', 'Head of Operations', 'Toronto, Ontario, Canada', 'Applied 3d ago',
+    'Resume', 'Share', 'Shortlist', 'Move to', 'Contact', 'Interview with AI',
+    'Qualifications', 'Top fit', '6/6', 'Must-have', '5/5', 'Preferred',
+    'Must-have', '10+ years of experience in operations leadership', 'Preferred', 'Deep fundraising network',
+    'Rate this AI-generated content', 'Experience', 'Chief Operating Officer', 'Acme Robotics • 2021-Present', 'View full profile',
+  ].join('\n\n');
+
+  it('returns the Qualifications section only', () => {
+    const q = extractQualificationsText(pane)!;
+    expect(q.startsWith('Qualifications\nTop fit\n6/6\nMust-have')).toBe(true);
+    expect(q).toContain('10+ years of experience in operations leadership');
+    expect(q).not.toContain('Rate this AI-generated content');
+    expect(q).not.toContain('Chief Operating Officer');
+  });
+
+  it('is undefined when the pane has no such section', () => {
+    expect(extractQualificationsText('Dana Whitfield\nApplied 3d ago\nResume')).toBeUndefined();
+    expect(sliceBetween('a\nb\nc', /^b$/, /^zzz$/)).toBe('b\nc');
   });
 });
