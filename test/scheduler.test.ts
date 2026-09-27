@@ -107,21 +107,45 @@ describe('Scheduler caps and breaks', () => {
 
 describe('cap variance (no two days alike)', () => {
   const days = ['2026-09-21', '2026-09-22', '2026-09-23', '2026-09-24', '2026-09-25', '2026-09-28', '2026-09-29', '2026-09-30'];
-  it('draws each day within the spread and never the same number every day', () => {
+  it('draws each day below the configured cap and never the same number every day', () => {
     const { s, setNow } = make('2026-09-21T08:00:00Z', { dailyApplicantCap: 100, dailyProfileCap: 60, hourlyActionCap: 40, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
     const seen = new Set<number>();
     for (const day of days) {
       setNow(`${day}T08:00:00Z`);
       const caps = s.effectiveCaps();
       expect(caps.applicants).toBeGreaterThanOrEqual(65);
-      expect(caps.applicants).toBeLessThanOrEqual(135);
+      expect(caps.applicants).toBeLessThanOrEqual(100);
       expect(caps.profiles).toBeGreaterThanOrEqual(39);
-      expect(caps.profiles).toBeLessThanOrEqual(81);
+      expect(caps.profiles).toBeLessThanOrEqual(60);
       expect(s.effectiveHourlyCap()).toBeGreaterThanOrEqual(26);
-      expect(s.effectiveHourlyCap()).toBeLessThanOrEqual(54);
+      expect(s.effectiveHourlyCap()).toBeLessThanOrEqual(40);
       seen.add(caps.applicants);
     }
     expect(seen.size).toBeGreaterThan(3);
+  });
+
+  it('never exceeds the configured caps over a year of days and hours, and averages about 1 - v / 2', () => {
+    const { s, setNow } = make('2026-01-01T08:00:00Z', { dailyApplicantCap: 120, dailyProfileCap: 80, hourlyActionCap: 40, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
+    let sum = 0;
+    let min = Infinity;
+    for (let i = 0; i < 365; i++) {
+      const day = new Date(Date.UTC(2026, 0, 1 + i, 8)).toISOString();
+      setNow(day);
+      const caps = s.effectiveCaps();
+      expect(caps.applicants).toBeLessThanOrEqual(120);
+      expect(caps.profiles).toBeLessThanOrEqual(80);
+      for (const h of [6, 9, 12, 15]) {
+        setNow(day.replace('T08', `T${String(h).padStart(2, '0')}`));
+        expect(s.effectiveHourlyCap()).toBeLessThanOrEqual(40);
+      }
+      sum += caps.applicants;
+      min = Math.min(min, caps.applicants);
+    }
+    expect(min).toBeGreaterThanOrEqual(78);
+    expect(sum / 365).toBeGreaterThan(120 * 0.825 - 5);
+    expect(sum / 365).toBeLessThan(120 * 0.825 + 5);
+    expect(s.expectedDailyCaps()).toEqual({ applicants: 99, profiles: 66 });
+    expect(s.rampedCaps()).toEqual({ applicants: 120, profiles: 80 });
   });
 
   it('is fixed for the day across restarts and processes, and varies by hour', () => {
@@ -129,6 +153,9 @@ describe('cap variance (no two days alike)', () => {
     const again = new Scheduler(db, () => pacing, () => new Date('2026-09-25T14:00:00Z'), Math.random);
     expect(again.effectiveCaps()).toEqual(s.effectiveCaps());
     expect(db.getSetting<string>('pacing.seed')).toBeTruthy();
+    // the first stored seed wins: a process that tries to store its own afterwards reads the existing one back
+    expect(db.setSettingIfAbsent('pacing.seed', 'late')).toBe(db.getSetting<string>('pacing.seed'));
+    expect(db.getSetting<string>('pacing.seed')).not.toBe('late');
     const hours = new Set([8, 9, 10, 11, 12, 13].map((h) => new Scheduler(db, () => pacing, () => new Date(`2026-09-25T${String(h).padStart(2, '0')}:00:00Z`)).effectiveHourlyCap()));
     expect(hours.size).toBeGreaterThan(1);
     // another installation gets other numbers from the same configuration
@@ -147,7 +174,8 @@ describe('cap variance (no two days alike)', () => {
     db.setSetting('first_action_at', '2026-09-24T08:00:00Z'); // day 1 of the ramp: 55
     const caps = s.effectiveCaps();
     expect(caps.applicants).toBeGreaterThanOrEqual(36);
-    expect(caps.applicants).toBeLessThanOrEqual(74);
+    expect(caps.applicants).toBeLessThanOrEqual(55);
+    expect(s.rampedCaps().applicants).toBe(55);
     const zero = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 0, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
     expect(zero.s.effectiveCaps().applicants).toBe(0);
     const exact = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 100, hourlyActionCap: 40, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0 });

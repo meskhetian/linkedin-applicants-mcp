@@ -132,27 +132,27 @@ export class Scheduler {
     return randInt(Math.min(a, b), Math.max(a, b), this.rng);
   }
 
-  /** Per-installation random seed for the cap variance, created once and kept in the database. */
+  /**
+   * Per-installation random seed for the cap variance, created once and kept in the database. The first process to
+   * store it wins (insert-if-absent, then read back), so the MCP server, the worker and the dashboard always agree.
+   */
   private seedValue?: string;
   private seed(): string {
     if (this.seedValue) return this.seedValue;
-    let s = this.db.getSetting<string>(SEED_SETTING);
-    if (!s) {
-      s = Math.floor(this.rng() * 0xffffffff).toString(36) + Date.now().toString(36);
-      this.db.setSetting(SEED_SETTING, s);
-    }
-    this.seedValue = s;
-    return s;
+    const existing = this.db.getSetting<string>(SEED_SETTING);
+    this.seedValue = existing || this.db.setSettingIfAbsent(SEED_SETTING, Math.floor(this.rng() * 0xffffffff).toString(36) + Date.now().toString(36));
+    return this.seedValue;
   }
 
   /**
-   * A cap varied for one key (a day or an hour): drawn once within (1 - variance) to (1 + variance) of the base and
-   * fixed for that key on this installation, so a restart or a second process cannot change today's number.
+   * A cap varied for one key (a day or an hour): drawn once between (1 - variance) and 1 times the base, fixed for
+   * that key on this installation, so a restart or a second process cannot change today's number. The draw only ever
+   * lowers the cap: the configured value stays a ceiling, so every limit documented for it still holds.
    */
   private varied(key: string, base: number, variance: number): number {
     if (base <= 0 || variance <= 0) return base;
-    const factor = 1 - variance + 2 * variance * hashUnit(`${this.seed()}|${key}`);
-    return Math.max(1, Math.round(base * factor));
+    const factor = 1 - variance * hashUnit(`${this.seed()}|${key}`);
+    return Math.max(1, Math.min(base, Math.round(base * factor)));
   }
 
   private jitterFor(dateKey: string) {
@@ -225,8 +225,8 @@ export class Scheduler {
     return Math.max(0, Math.floor((d.getTime() - new Date(first).getTime()) / 86_400_000));
   }
 
-  /** Today's caps: the configured caps after the warm-up ramp, then varied for the day like a person's workload. */
-  effectiveCaps(d: Date = this.now()): { applicants: number; profiles: number } {
+  /** The configured caps after the warm-up ramp, before the day's variation (the ceiling for the day). */
+  rampedCaps(d: Date = this.now()): { applicants: number; profiles: number } {
     const p = this.getPacing();
     let applicants = p.dailyApplicantCap;
     let profiles = p.dailyProfileCap;
@@ -235,9 +235,22 @@ export class Scheduler {
       applicants = Math.min(applicants, Math.max(1, ramp));
       profiles = Math.min(profiles, Math.max(1, Math.round(ramp * 0.7)));
     }
-    const v = p.dailyCapVariance ?? 0;
+    return { applicants, profiles };
+  }
+
+  /** Today's caps: the ramped caps, lowered by the day's draw like a person's uneven workload. */
+  effectiveCaps(d: Date = this.now()): { applicants: number; profiles: number } {
+    const { applicants, profiles } = this.rampedCaps(d);
+    const v = this.getPacing().dailyCapVariance ?? 0;
     const { dateKey } = localParts(d, this.tz());
     return { applicants: this.varied(`applicants:${dateKey}`, applicants, v), profiles: this.varied(`profiles:${dateKey}`, profiles, v) };
+  }
+
+  /** What an average day allows (the draw averages 1 - variance / 2 of the ceiling): use this for multi-day estimates. */
+  expectedDailyCaps(d: Date = this.now()): { applicants: number; profiles: number } {
+    const { applicants, profiles } = this.rampedCaps(d);
+    const f = 1 - (this.getPacing().dailyCapVariance ?? 0) / 2;
+    return { applicants: Math.max(1, Math.round(applicants * f)), profiles: Math.max(1, Math.round(profiles * f)) };
   }
 
   /** This hour's action cap: the configured cap, varied per hour the same way as the daily caps. */

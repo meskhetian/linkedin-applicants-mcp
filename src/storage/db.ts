@@ -226,6 +226,12 @@ export class Db {
     return row ? pj<T>(row.value) : undefined;
   }
 
+  /** Store a setting only if the key is still absent (first writer wins across processes); returns the stored value. */
+  setSettingIfAbsent<T>(key: string, value: T): T {
+    this.prep('INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING').run(key, JSON.stringify(value), nowIso());
+    return this.getSetting<T>(key) as T;
+  }
+
   setSetting(key: string, value: unknown): void {
     this.prep(
       'INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',

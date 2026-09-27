@@ -150,7 +150,7 @@ export function registerQueueTools(server: McpServer, deps: Deps): void {
           .min(0)
           .max(0.5)
           .optional()
-          .describe("Day-to-day spread of the caps: each day's caps and each hour's cap are drawn within this fraction of the configured value (0.35 = plus or minus 35 percent, so 120 becomes anything from 78 to 162). 0 = exact numbers every day"),
+          .describe("Day-to-day spread of the caps: each day's caps and each hour's cap are drawn within this fraction of the configured value (0.35 = up to 35 percent lower, so a cap of 120 becomes anything from 78 to 120; the configured cap is never exceeded). 0 = exact numbers every day"),
         randomizeOrder: z.boolean().optional(),
         warmupProbability: z.number().min(0).max(0.5).optional(),
       },

@@ -126,9 +126,13 @@ changes; they are called out explicitly.
 ### Added
 
 - **Caps vary like a person's workload.** Each day's application and profile caps and each hour's action cap are
-  drawn once within ±35 percent of the configured (ramped) value (67 one day, 43 the next) and fixed for that day
-  or hour, so a restart or a second process cannot change today's number. `dailyCapVariance` (also
-  `LINKEDIN_MCP_DAILY_CAP_VARIANCE`) sets the spread; 0 restores exact caps. `queue_status`, `pacing_get` and the
+  drawn once between 65 and 100 percent of the configured (ramped) value (67 one day, 43 the next) and fixed for
+  that day or hour, so a restart or a second process cannot change today's number. The draw only ever lowers a cap:
+  the configured value stays a ceiling, so the documented safe limits hold on every day (a first version drew up to
+  35 percent above it, which turned a configured 80 profiles into days of 108). `dailyCapVariance` (also
+  `LINKEDIN_MCP_DAILY_CAP_VARIANCE`, `.env.example`) sets the spread; 0 restores exact caps. Multi-day estimates
+  use an average day's caps rather than today's single draw, and the seed is stored first-writer-wins so every
+  process draws the same numbers. `queue_status`, `pacing_get` and the
   dashboard show today's numbers.
 - README: what LinkedIn actually limits (documented versus folklore), a concrete pacing plan for a job with about
   1,000 applicants, and the warning signs with the response to each.

@@ -135,6 +135,7 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
       const result = enqueueAll(deps, payloads);
       deps.worker.start();
       const caps = deps.scheduler.effectiveCaps();
+      const perDay = deps.scheduler.expectedDailyCaps(); // today's draw is one day; an average day drives the estimate
       const pending = deps.db.pendingByType();
       const detailsQueued = pending.fetch_application ?? 0;
       const profilesQueued = (pending.fetch_profile ?? 0) + (includeProfile ? result.enqueued : 0);
@@ -145,9 +146,9 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
         queueNow: pending,
         effectiveDailyCaps: caps,
         estimate: {
-          detailDays: Math.ceil(detailsQueued / Math.max(1, caps.applicants)),
-          profileDays: includeProfile ? Math.ceil(profilesQueued / Math.max(1, caps.profiles)) : 0,
-          note: 'Estimates assume work-hour windows every work day. Caps ramp up over the first days on purpose; raise them cautiously with pacing_set.',
+          detailDays: Math.ceil(detailsQueued / perDay.applicants),
+          profileDays: includeProfile ? Math.ceil(profilesQueued / perDay.profiles) : 0,
+          note: "Estimates assume work-hour windows every work day and an average day's caps (each day draws its own, up to the configured cap). Caps ramp up over the first days on purpose; raise them cautiously with pacing_set.",
         },
       });
     }),
@@ -198,12 +199,12 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
         targets.map((t) => ({ type: 'fetch_profile', jobId: t.jobId, applicationId: t.applicationId, profileUrl: t.profileUrl, depth: depth as ProfileDepth, savePdf })),
       );
       deps.worker.start();
-      const caps = deps.scheduler.effectiveCaps();
+      const perDay = deps.scheduler.expectedDailyCaps();
       return ok({
         ...result,
         targeted: targets.length,
         skippedNoProfileUrl: missingUrl,
-        estimateDays: Math.ceil((deps.db.pendingByType().fetch_profile ?? 0) / Math.max(1, caps.profiles)),
+        estimateDays: Math.ceil((deps.db.pendingByType().fetch_profile ?? 0) / perDay.profiles),
         note: missingUrl ? 'Applicants without a profile URL need applicants_fetch_details first (the application page links to the profile).' : undefined,
       });
     }),

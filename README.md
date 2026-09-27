@@ -326,7 +326,7 @@ Everything below is the `normal` speed. Slower is safer; the defaults mimic one 
 | Mechanism | Default | Adjust with `pacing_set` |
 | --- | --- | --- |
 | Working hours and days | 09:00–19:00 local time (or `timezone`), Mon–Fri, start/end jittered per day | `workHoursStart`, `workHoursEnd`, `workDays`, `timezone` |
-| Daily cap: application pages | 120, **ramped**: 25 on day 1, +10 per day until the cap; **each day draws its own number** within ±35 % of that (67 one day, 43 the next), fixed for the day | `dailyApplicantCap`, `rampStart`, `rampPerDay`, `dailyCapVariance` |
+| Daily cap: application pages | 120, **ramped**: 25 on day 1, +10 per day until the cap; **each day draws its own number** between 65 % and 100 % of that (67 one day, 43 the next), fixed for the day; the configured cap is never exceeded | `dailyApplicantCap`, `rampStart`, `rampPerDay`, `dailyCapVariance` |
 | Daily cap: full profile views | 80, ramped at 70 % of the applicant ramp, varied per day the same way | `dailyProfileCap` |
 | Hourly cap: LinkedIn page actions | 40 per rolling hour, varied per hour the same way | `hourlyActionCap` |
 | Long breaks | every 25–60 actions, 5–20 minutes | `breakEveryActions`, `breakMinutes` |
@@ -398,7 +398,7 @@ All settings are environment variables (see [.env.example](.env.example)). Pacin
 | `LINKEDIN_MCP_DAILY_PROFILE_CAP` | `80` | Full profile views per day |
 | `LINKEDIN_MCP_HOURLY_ACTION_CAP` | `40` | LinkedIn page actions per rolling hour |
 | `LINKEDIN_MCP_RAMP_START` / `LINKEDIN_MCP_RAMP_PER_DAY` | `25` / `10` | Warm-up ramp; `0` disables it |
-| `LINKEDIN_MCP_DAILY_CAP_VARIANCE` | `0.35` | Day-to-day spread of the caps (each day and hour draws within this fraction of the configured value); `0` = exact numbers |
+| `LINKEDIN_MCP_DAILY_CAP_VARIANCE` | `0.35` | Day-to-day spread of the caps: each day and hour draws up to this fraction below the configured value, never above it; `0` = exact numbers |
 | `LINKEDIN_MCP_SAVE_PDF_MONTHLY_CAP` | `150` | Cap for LinkedIn "Save to PDF" |
 | `LINKEDIN_MCP_AUTOSTART_WORKER` | `true` | Start the worker inside the MCP server process |
 | `LINKEDIN_MCP_CAPTURE_RAW` | `false` | Persist every captured LinkedIn payload under `<data>/debug/raw` (heavy) |
