@@ -84,6 +84,7 @@ function summary() {
     inWorkWindow: scheduler.inWorkWindow(),
     nextWindowStart: scheduler.inWorkWindow() ? null : scheduler.nextWindowStart().toISOString(),
     effectiveCaps: scheduler.effectiveCaps(),
+    effectiveHourlyCap: scheduler.effectiveHourlyCap(),
     pacing: { speed: pacing.speed, workHours: `${pacing.workHoursStart}-${pacing.workHoursEnd}`, workDays: pacing.workDays, rampDay: scheduler.daysSinceFirstAction() },
     events: db.recentEvents(15),
     jobRows: jobs.map((j) => ({ ...j, raw: undefined, syncProgress: db.getSyncProgress(j.jobId) })),

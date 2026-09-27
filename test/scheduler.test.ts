@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { defaultPacing } from '../src/config.js';
-import { Scheduler, localParts, zonedToUtc } from '../src/queue/scheduler.js';
+import { Scheduler, hashUnit, localParts, zonedToUtc } from '../src/queue/scheduler.js';
 import { Db } from '../src/storage/db.js';
 import type { PacingSettings } from '../src/types.js';
 
@@ -8,7 +8,7 @@ const TZ = 'Europe/Istanbul'; // UTC+3, no DST
 
 function make(nowIso: string, over: Partial<PacingSettings> = {}) {
   const db = new Db(':memory:');
-  const pacing: PacingSettings = { ...defaultPacing('normal'), timezone: TZ, workHoursStart: '09:00', workHoursEnd: '19:00', workDays: [1, 2, 3, 4, 5], ...over };
+  const pacing: PacingSettings = { ...defaultPacing('normal'), timezone: TZ, workHoursStart: '09:00', workHoursEnd: '19:00', workDays: [1, 2, 3, 4, 5], dailyCapVariance: 0, ...over };
   let now = new Date(nowIso);
   const rng = () => 0; // zero jitter → deterministic window edges
   const s = new Scheduler(db, () => pacing, () => now, rng);
@@ -102,5 +102,59 @@ describe('Scheduler caps and breaks', () => {
     const s2 = new Scheduler(db, () => ({ ...defaultPacing('normal'), timezone: TZ }), () => new Date('2026-09-25T08:30:00Z'));
     expect(s2.todayCounts().profiles).toBe(1);
     expect(s2.todayCounts().actions).toBe(1);
+  });
+});
+
+describe('cap variance (no two days alike)', () => {
+  const days = ['2026-09-21', '2026-09-22', '2026-09-23', '2026-09-24', '2026-09-25', '2026-09-28', '2026-09-29', '2026-09-30'];
+  it('draws each day within the spread and never the same number every day', () => {
+    const { s, setNow } = make('2026-09-21T08:00:00Z', { dailyApplicantCap: 100, dailyProfileCap: 60, hourlyActionCap: 40, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
+    const seen = new Set<number>();
+    for (const day of days) {
+      setNow(`${day}T08:00:00Z`);
+      const caps = s.effectiveCaps();
+      expect(caps.applicants).toBeGreaterThanOrEqual(65);
+      expect(caps.applicants).toBeLessThanOrEqual(135);
+      expect(caps.profiles).toBeGreaterThanOrEqual(39);
+      expect(caps.profiles).toBeLessThanOrEqual(81);
+      expect(s.effectiveHourlyCap()).toBeGreaterThanOrEqual(26);
+      expect(s.effectiveHourlyCap()).toBeLessThanOrEqual(54);
+      seen.add(caps.applicants);
+    }
+    expect(seen.size).toBeGreaterThan(3);
+  });
+
+  it('is fixed for the day across restarts and processes, and varies by hour', () => {
+    const { db, s, pacing } = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 100, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
+    const again = new Scheduler(db, () => pacing, () => new Date('2026-09-25T14:00:00Z'), Math.random);
+    expect(again.effectiveCaps()).toEqual(s.effectiveCaps());
+    expect(db.getSetting<string>('pacing.seed')).toBeTruthy();
+    const hours = new Set([8, 9, 10, 11, 12, 13].map((h) => new Scheduler(db, () => pacing, () => new Date(`2026-09-25T${String(h).padStart(2, '0')}:00:00Z`)).effectiveHourlyCap()));
+    expect(hours.size).toBeGreaterThan(1);
+    // another installation gets other numbers from the same configuration
+    const other = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 100, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
+    other.db.setSetting('pacing.seed', 'elsewhere');
+    const differs = days.some((day) => {
+      other.setNow(`${day}T08:00:00Z`);
+      s.effectiveCaps();
+      return other.s.effectiveCaps().applicants !== new Scheduler(db, () => pacing, () => new Date(`${day}T08:00:00Z`)).effectiveCaps().applicants;
+    });
+    expect(differs).toBe(true);
+  });
+
+  it('applies to the ramped value, keeps zero caps at zero, and 0 restores exact numbers', () => {
+    const { s, db } = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 120, rampStart: 40, rampPerDay: 15, dailyCapVariance: 0.35 });
+    db.setSetting('first_action_at', '2026-09-24T08:00:00Z'); // day 1 of the ramp: 55
+    const caps = s.effectiveCaps();
+    expect(caps.applicants).toBeGreaterThanOrEqual(36);
+    expect(caps.applicants).toBeLessThanOrEqual(74);
+    const zero = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 0, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0.35 });
+    expect(zero.s.effectiveCaps().applicants).toBe(0);
+    const exact = make('2026-09-25T08:00:00Z', { dailyApplicantCap: 100, hourlyActionCap: 40, rampStart: 0, rampPerDay: 0, dailyCapVariance: 0 });
+    expect(exact.s.effectiveCaps().applicants).toBe(100);
+    expect(exact.s.effectiveHourlyCap()).toBe(40);
+    expect(hashUnit('a')).not.toBe(hashUnit('b'));
+    expect(hashUnit('2026-09-25')).toBeGreaterThanOrEqual(0);
+    expect(hashUnit('2026-09-25')).toBeLessThan(1);
   });
 });

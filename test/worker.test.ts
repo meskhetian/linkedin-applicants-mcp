@@ -15,7 +15,7 @@ function makeDeps(runners: Partial<Record<TaskType, TaskRunner>>) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'li-worker-'));
   const cfg = loadConfig({ dataDir: tmp });
   const db = new Db(':memory:');
-  const pacing: PacingSettings = { ...defaultPacing('normal'), workHoursStart: '00:00', workHoursEnd: '23:59', workDays: [0, 1, 2, 3, 4, 5, 6], warmupProbability: 0, breakEveryActions: [1000, 1000], rampStart: 0, rampPerDay: 0 };
+  const pacing: PacingSettings = { ...defaultPacing('normal'), workHoursStart: '00:00', workHoursEnd: '23:59', workDays: [0, 1, 2, 3, 4, 5, 6], warmupProbability: 0, breakEveryActions: [1000, 1000], rampStart: 0, rampPerDay: 0, dailyCapVariance: 0 };
   // zero jitter + fixed noon clock so the test never falls outside the work window
   const scheduler = new Scheduler(db, () => pacing, () => new Date(new Date().setHours(12, 0, 0, 0)), () => 0);
   const fakeCtx = { page: {}, human: { delayMs: () => 1, goto: async () => {}, scrollPage: async () => {} }, capture: {}, assertHealthy: async () => {}, generation: async () => 'sdui', cfg, db, log: silentLogger } as unknown as ScrapeContext;

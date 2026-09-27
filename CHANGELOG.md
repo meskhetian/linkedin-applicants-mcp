@@ -125,6 +125,11 @@ changes; they are called out explicitly.
 
 ### Added
 
+- **Caps vary like a person's workload.** Each day's application and profile caps and each hour's action cap are
+  drawn once within ±35 percent of the configured (ramped) value (67 one day, 43 the next) and fixed for that day
+  or hour, so a restart or a second process cannot change today's number. `dailyCapVariance` (also
+  `LINKEDIN_MCP_DAILY_CAP_VARIANCE`) sets the spread; 0 restores exact caps. `queue_status`, `pacing_get` and the
+  dashboard show today's numbers.
 - README: what LinkedIn actually limits (documented versus folklore), a concrete pacing plan for a job with about
   1,000 applicants, and the warning signs with the response to each.
 - `applicants_fetch_details` fetches the applicants who match the job's must-have qualifications best first

@@ -350,6 +350,12 @@ export interface PacingSettings {
    */
   rampStart: number;
   rampPerDay: number;
+  /**
+   * Day-to-day spread of the caps, as a fraction: each day's applicant and profile caps and each hour's action cap
+   * are drawn once within (1 - v) to (1 + v) of the configured (ramped) value, fixed for that day or hour, so no two
+   * days look alike (67 one day, 43 the next). 0 = exact caps every day.
+   */
+  dailyCapVariance: number;
   /** Hard monthly cap for LinkedIn's "Save to PDF" (official limit is 200/month per account) */
   savePdfMonthlyCap: number;
 }

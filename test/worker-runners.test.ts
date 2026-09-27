@@ -23,7 +23,7 @@ function makeDeps() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'li-runners-'));
   const cfg = loadConfig({ dataDir: tmp });
   const db = new Db(':memory:');
-  const pacing: PacingSettings = { ...defaultPacing('normal'), workHoursStart: '00:00', workHoursEnd: '23:59', workDays: [0, 1, 2, 3, 4, 5, 6], warmupProbability: 0, breakEveryActions: [1000, 1000], rampStart: 0, rampPerDay: 0 };
+  const pacing: PacingSettings = { ...defaultPacing('normal'), workHoursStart: '00:00', workHoursEnd: '23:59', workDays: [0, 1, 2, 3, 4, 5, 6], warmupProbability: 0, breakEveryActions: [1000, 1000], rampStart: 0, rampPerDay: 0, dailyCapVariance: 0 };
   const scheduler = new Scheduler(db, () => pacing, () => new Date(new Date().setHours(12, 0, 0, 0)), () => 0);
   const fakeCtx = { page: {}, human: { delayMs: () => 1 }, capture: {}, assertHealthy: async () => {}, cfg, db, log: silentLogger } as unknown as ScrapeContext;
   const deps: WorkerDeps = { cfg, db, log: silentLogger, session: { isConnected: () => true } as never, scheduler, getPacing: () => pacing, ownerKind: 'cli', sleep: async () => {}, createContext: async () => fakeCtx };

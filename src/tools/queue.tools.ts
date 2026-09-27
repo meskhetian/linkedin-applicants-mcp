@@ -28,6 +28,7 @@ export function registerQueueTools(server: McpServer, deps: Deps): void {
         tasks: db.taskCounts(),
         pendingByType: db.pendingByType(),
         effectiveDailyCaps: scheduler.effectiveCaps(),
+        effectiveHourlyCap: scheduler.effectiveHourlyCap(),
         inWorkWindow: scheduler.inWorkWindow(),
         nextWindowStart: scheduler.inWorkWindow() ? undefined : scheduler.nextWindowStart().toISOString(),
         pacing: { speed: pacing.speed, workHours: `${pacing.workHoursStart}-${pacing.workHoursEnd}`, workDays: pacing.workDays, timezone: pacing.timezone ?? 'system', rampDay: scheduler.daysSinceFirstAction() },
@@ -124,7 +125,7 @@ export function registerQueueTools(server: McpServer, deps: Deps): void {
   server.registerTool(
     'pacing_get',
     { title: 'Get pacing settings', description: 'Current human-pacing settings: speed, working hours/days, daily caps (with warm-up ramp), hourly cap, break pattern, delay table.', annotations: { readOnlyHint: true, openWorldHint: false, idempotentHint: true } },
-    guard(async () => ok({ pacing: deps.getPacing(), effectiveDailyCaps: scheduler.effectiveCaps(), rampDay: scheduler.daysSinceFirstAction() })),
+    guard(async () => ok({ pacing: deps.getPacing(), effectiveDailyCaps: scheduler.effectiveCaps(), effectiveHourlyCap: scheduler.effectiveHourlyCap(), rampDay: scheduler.daysSinceFirstAction() })),
   );
 
   server.registerTool(
@@ -144,6 +145,12 @@ export function registerQueueTools(server: McpServer, deps: Deps): void {
         hourlyActionCap: z.number().int().min(1).max(200).optional(),
         rampStart: z.number().int().min(0).max(600).optional().describe('Day-1 cap; 0 disables the warm-up ramp'),
         rampPerDay: z.number().int().min(0).max(200).optional(),
+        dailyCapVariance: z
+          .number()
+          .min(0)
+          .max(0.5)
+          .optional()
+          .describe("Day-to-day spread of the caps: each day's caps and each hour's cap are drawn within this fraction of the configured value (0.35 = plus or minus 35 percent, so 120 becomes anything from 78 to 162). 0 = exact numbers every day"),
         randomizeOrder: z.boolean().optional(),
         warmupProbability: z.number().min(0).max(0.5).optional(),
       },
@@ -171,7 +178,7 @@ export function registerQueueTools(server: McpServer, deps: Deps): void {
       if (clean.rampStart === 0) warnings.push('Warm-up ramp disabled: new automation at full speed is the most common restriction trigger.');
       const pacing = deps.setPacing(clean);
       db.addEvent('info', 'control', 'pacing changed', clean);
-      return ok({ pacing, effectiveDailyCaps: scheduler.effectiveCaps(), warnings });
+      return ok({ pacing, effectiveDailyCaps: scheduler.effectiveCaps(), effectiveHourlyCap: scheduler.effectiveHourlyCap(), warnings });
     }),
   );
 }

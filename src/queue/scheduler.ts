@@ -18,6 +18,23 @@ interface LocalParts {
 
 const WEEKDAYS: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
+const SEED_SETTING = 'pacing.seed';
+
+/** Deterministic hash of a string to [0, 1): FNV-1a with a final avalanche, so neighbouring keys spread apart. */
+export function hashUnit(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h ^= h >>> 16;
+  return (h >>> 0) / 0x100000000;
+}
+
 export function localParts(d: Date, timeZone?: string): LocalParts {
   const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone,
@@ -115,6 +132,29 @@ export class Scheduler {
     return randInt(Math.min(a, b), Math.max(a, b), this.rng);
   }
 
+  /** Per-installation random seed for the cap variance, created once and kept in the database. */
+  private seedValue?: string;
+  private seed(): string {
+    if (this.seedValue) return this.seedValue;
+    let s = this.db.getSetting<string>(SEED_SETTING);
+    if (!s) {
+      s = Math.floor(this.rng() * 0xffffffff).toString(36) + Date.now().toString(36);
+      this.db.setSetting(SEED_SETTING, s);
+    }
+    this.seedValue = s;
+    return s;
+  }
+
+  /**
+   * A cap varied for one key (a day or an hour): drawn once within (1 - variance) to (1 + variance) of the base and
+   * fixed for that key on this installation, so a restart or a second process cannot change today's number.
+   */
+  private varied(key: string, base: number, variance: number): number {
+    if (base <= 0 || variance <= 0) return base;
+    const factor = 1 - variance + 2 * variance * hashUnit(`${this.seed()}|${key}`);
+    return Math.max(1, Math.round(base * factor));
+  }
+
   private jitterFor(dateKey: string) {
     let j = this.dayJitter.get(dateKey);
     if (!j) {
@@ -185,12 +225,25 @@ export class Scheduler {
     return Math.max(0, Math.floor((d.getTime() - new Date(first).getTime()) / 86_400_000));
   }
 
-  /** Daily caps after the warm-up ramp. */
+  /** Today's caps: the configured caps after the warm-up ramp, then varied for the day like a person's workload. */
   effectiveCaps(d: Date = this.now()): { applicants: number; profiles: number } {
     const p = this.getPacing();
-    if (!p.rampStart || !p.rampPerDay) return { applicants: p.dailyApplicantCap, profiles: p.dailyProfileCap };
-    const ramp = p.rampStart + p.rampPerDay * this.daysSinceFirstAction(d);
-    return { applicants: Math.min(p.dailyApplicantCap, Math.max(1, ramp)), profiles: Math.min(p.dailyProfileCap, Math.max(1, Math.round(ramp * 0.7))) };
+    let applicants = p.dailyApplicantCap;
+    let profiles = p.dailyProfileCap;
+    if (p.rampStart && p.rampPerDay) {
+      const ramp = p.rampStart + p.rampPerDay * this.daysSinceFirstAction(d);
+      applicants = Math.min(applicants, Math.max(1, ramp));
+      profiles = Math.min(profiles, Math.max(1, Math.round(ramp * 0.7)));
+    }
+    const v = p.dailyCapVariance ?? 0;
+    const { dateKey } = localParts(d, this.tz());
+    return { applicants: this.varied(`applicants:${dateKey}`, applicants, v), profiles: this.varied(`profiles:${dateKey}`, profiles, v) };
+  }
+
+  /** This hour's action cap: the configured cap, varied per hour the same way as the daily caps. */
+  effectiveHourlyCap(d: Date = this.now()): number {
+    const p = this.getPacing();
+    return this.varied(`hour:${localParts(d, this.tz()).hourKey}`, p.hourlyActionCap, p.dailyCapVariance ?? 0);
   }
 
   /** May a task of this type run right now? */
@@ -211,11 +264,12 @@ export class Scheduler {
       return { ok: false, reason: `daily profile cap reached (${today.profiles}/${caps.profiles})`, resumeAt: this.nextDayWindowStart(d), scope: 'type' };
     }
     const hour = this.hourCount(d);
-    if (hour >= p.hourlyActionCap) {
+    const hourlyCap = this.effectiveHourlyCap(d);
+    if (hour >= hourlyCap) {
       const lp = localParts(d, this.tz());
       const nextHour = zonedToUtc(lp.dateKey, `${lp.hour}:00`, this.tz());
       const resume = new Date(nextHour.getTime() + 3_600_000 + randInt(60_000, 300_000, this.rng));
-      return { ok: false, reason: `hourly action cap reached (${hour}/${p.hourlyActionCap})`, resumeAt: resume, scope: 'global' };
+      return { ok: false, reason: `hourly action cap reached (${hour}/${hourlyCap})`, resumeAt: resume, scope: 'global' };
     }
     return { ok: true };
   }

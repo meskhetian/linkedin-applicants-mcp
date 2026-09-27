@@ -86,7 +86,7 @@ It binds to `127.0.0.1` only, applicant data is personal information, serves GET
 ```
 
 1. **Tools only enqueue.** Every tool that touches LinkedIn (`jobs_sync`, `applicants_sync`, `applicants_fetch_details`, `applicants_fetch_profiles`) writes tasks to SQLite and returns immediately; the background worker does the browsing. Tasks survive restarts, and the progress of a long applicant list is saved after every page.
-2. **The scheduler decides when the worker may act:** inside working hours and days (start and end jittered every day), under the rolling hourly cap and the daily caps, and never during a break. Daily caps ramp up from a small day-1 value so a fresh setup does not start at full speed. An owner lock in the database makes sure only one process drives the browser.
+2. **The scheduler decides when the worker may act:** inside working hours and days (start and end jittered every day), under the rolling hourly cap and the daily caps, and never during a break. Daily caps ramp up from a small day-1 value so a fresh setup does not start at full speed, and every day's caps and every hour's cap are drawn afresh within a spread around the configured value, so no two days look alike. An owner lock in the database makes sure only one process drives the browser.
 3. **Input looks human.** Bézier mouse paths with occasional overshoot, uneven wheel scrolling with back-scrolls, variable typing rhythm, and clipped log-normal pauses (long right tail) after clicks, while "reading" a page, between applicants and between profiles. Same-priority tasks are shuffled and the worker occasionally drops by the feed.
 4. **It stops when LinkedIn asks for a human.** Verification, CAPTCHA, "unusual activity" and login pages are detected from the URL and strong page-text signals. The task is requeued without burning an attempt, the queue is flagged `needsHuman`, and nothing runs until you solve the page in the Chrome window and call `queue_resume`. HTTP 429/999 back the queue off for hours; three unexpected failures in a row trigger a 20–40 minute cool-down.
 5. **Both LinkedIn hiring dashboards are supported**, detected per job from the URL LinkedIn lands on. The classic Ember list (`/hiring/jobs/<id>/applicants/?r=<BUCKET>&sort_by=APPLIED_DATE&start=N`, 25 per page) is crawled per rating bucket, Unrated, Good fit, Maybe and the hidden Not a fit. The 2026 "Hiring Pro" server-driven UI (`/hiring/applicants/?jobId=<id>&rating=ALL&sort=DateApplied`, 25 per page) uses numbered page buttons, a `start=` offset in the URL and resume downloads that open a signed URL in a new tab. The classic list is sorted by applied date, so its pagination stays stable across days. The Hiring Pro list ignores sort parameters and orders by qualification match with unstable ties, so a first pass ends a few percent short; a complete list that is more than 2 percent short gets one sweep through LinkedIn's table view, which does honour date order (see Troubleshooting). Raw page snapshots are kept next to the data so parsers can be repaired offline after LinkedIn deploys.
@@ -326,9 +326,9 @@ Everything below is the `normal` speed. Slower is safer; the defaults mimic one 
 | Mechanism | Default | Adjust with `pacing_set` |
 | --- | --- | --- |
 | Working hours and days | 09:00–19:00 local time (or `timezone`), Mon–Fri, start/end jittered per day | `workHoursStart`, `workHoursEnd`, `workDays`, `timezone` |
-| Daily cap: application pages | 120, **ramped**: 25 on day 1, +10 per day until the cap | `dailyApplicantCap`, `rampStart`, `rampPerDay` |
-| Daily cap: full profile views | 80, ramped at 70 % of the applicant ramp | `dailyProfileCap` |
-| Hourly cap: LinkedIn page actions | 40 per rolling hour | `hourlyActionCap` |
+| Daily cap: application pages | 120, **ramped**: 25 on day 1, +10 per day until the cap; **each day draws its own number** within ±35 % of that (67 one day, 43 the next), fixed for the day | `dailyApplicantCap`, `rampStart`, `rampPerDay`, `dailyCapVariance` |
+| Daily cap: full profile views | 80, ramped at 70 % of the applicant ramp, varied per day the same way | `dailyProfileCap` |
+| Hourly cap: LinkedIn page actions | 40 per rolling hour, varied per hour the same way | `hourlyActionCap` |
 | Long breaks | every 25–60 actions, 5–20 minutes | `breakEveryActions`, `breakMinutes` |
 | Order | same-priority tasks shuffled; 8 % chance of a warm-up visit to the feed | `randomizeOrder`, `warmupProbability` |
 | LinkedIn "Save to PDF" | at most 150 profiles per month (LinkedIn's own limit is 200) | `LINKEDIN_MCP_SAVE_PDF_MONTHLY_CAP` |
@@ -398,6 +398,7 @@ All settings are environment variables (see [.env.example](.env.example)). Pacin
 | `LINKEDIN_MCP_DAILY_PROFILE_CAP` | `80` | Full profile views per day |
 | `LINKEDIN_MCP_HOURLY_ACTION_CAP` | `40` | LinkedIn page actions per rolling hour |
 | `LINKEDIN_MCP_RAMP_START` / `LINKEDIN_MCP_RAMP_PER_DAY` | `25` / `10` | Warm-up ramp; `0` disables it |
+| `LINKEDIN_MCP_DAILY_CAP_VARIANCE` | `0.35` | Day-to-day spread of the caps (each day and hour draws within this fraction of the configured value); `0` = exact numbers |
 | `LINKEDIN_MCP_SAVE_PDF_MONTHLY_CAP` | `150` | Cap for LinkedIn "Save to PDF" |
 | `LINKEDIN_MCP_AUTOSTART_WORKER` | `true` | Start the worker inside the MCP server process |
 | `LINKEDIN_MCP_CAPTURE_RAW` | `false` | Persist every captured LinkedIn payload under `<data>/debug/raw` (heavy) |

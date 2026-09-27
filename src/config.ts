@@ -43,6 +43,11 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(v) ? v : fallback;
 }
 
+function envFloat(name: string, fallback: number): number {
+  const v = Number.parseFloat(env(name, String(fallback)));
+  return Number.isFinite(v) ? v : fallback;
+}
+
 /**
  * Delay tables per speed. Values are milliseconds: {min, median, max} of a clipped log-normal.
  * "normal" is tuned to look like a recruiter working through applicants attentively.
@@ -101,6 +106,7 @@ export function defaultPacing(speed: Speed = 'normal'): PacingSettings {
     warmupProbability: 0.08,
     rampStart: envInt('LINKEDIN_MCP_RAMP_START', 25),
     rampPerDay: envInt('LINKEDIN_MCP_RAMP_PER_DAY', 10),
+    dailyCapVariance: Math.min(0.5, Math.max(0, envFloat('LINKEDIN_MCP_DAILY_CAP_VARIANCE', 0.35))),
     savePdfMonthlyCap: envInt('LINKEDIN_MCP_SAVE_PDF_MONTHLY_CAP', 150),
   };
 }
