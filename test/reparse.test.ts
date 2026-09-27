@@ -20,7 +20,7 @@ describe('reparseListRows', () => {
   it('repairs names, headlines and the viewed flag from the stored raw text', () => {
     const db = seed();
     const r = reparseListRows(db);
-    expect(r).toEqual({ rows: 3, changed: 2 });
+    expect(r).toEqual({ rows: 3, changed: 2, ratingsCleared: 0 });
     const a1 = db.getApplicant('a1')!;
     expect(a1.fullName).toBe('Dana Whitfield');
     expect(a1.headline).toBe('Head of Operations | Scaling logistics platforms');
@@ -43,6 +43,24 @@ describe('reparseListRows', () => {
     expect(reparseListRows(db).changed).toBe(0);
     expect(db.getApplicant('a3')!.fullName).toBe('Grace B. Hopper');
     expect(db.getApplicant('a3')!.headline).toBe('Rear Admiral');
+  });
+
+  it('clears ratings that older sweeps took from the table match label', () => {
+    const db = seed();
+    db.upsertApplicantFromList({ applicationId: 'a9', jobId: 'j1', fullName: 'Swept Person', rating: 'not_a_fit', listSyncedAt: now, raw: { source: 'table-sweep', rowText: 'Swept Person\nApplied on: 9/19/2026', fitLabel: 'Not a fit' } });
+    expect(reparseListRows(db).ratingsCleared).toBe(1);
+    expect(db.getApplicant('a9')!.rating).toBeUndefined();
+    expect(db.getApplicant('a9')!.fullName).toBe('Swept Person');
+  });
+
+  it('leaves rows recovered by a table sweep otherwise untouched', () => {
+    const db = seed();
+    db.upsertApplicantFromList({ applicationId: 'a8', jobId: 'j1', fullName: 'Swept Person', headline: 'VP Sales at Acme', location: 'Istanbul', appliedAt: '2026-06-29T00:00:00.000Z', listSyncedAt: now, raw: { source: 'table-sweep', rowText: 'Swept Person\nApplied on: 6/29/2026', fitLabel: 'Top fit' } });
+    expect(reparseListRows(db).changed).toBe(2);
+    const a8 = db.getApplicant('a8')!;
+    expect(a8.headline).toBe('VP Sales at Acme');
+    expect(a8.location).toBe('Istanbul');
+    expect(a8.appliedAt).toBe('2026-06-29T00:00:00.000Z');
   });
 
   it('runs once per parser version at startup', () => {

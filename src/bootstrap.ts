@@ -32,7 +32,7 @@ export function bootstrap(opts: { ownerKind: 'mcp' | 'cli'; cfg?: Config }): Dep
   const stale = db.resetStaleRunning();
   if (stale) log.warn('reset stale running tasks from a previous process', { count: stale });
   const reparsed = reparseIfParserChanged(db);
-  if (reparsed?.changed) log.info('re-parsed stored applicant rows with the current parser', { ...reparsed });
+  if (reparsed?.changed || reparsed?.ratingsCleared) log.info('re-parsed stored applicant rows with the current parser', { ...reparsed });
 
   const getPacing = (): PacingSettings => mergePacing(cfg.pacingDefaults, db.getSetting<Partial<PacingSettings>>(SETTINGS.pacing));
   // Other processes (dashboard, CLI worker started without the MCP env) read the effective pacing from here.

@@ -7,7 +7,7 @@ import { SEL } from './selectors.js';
 import { APPLICANTS_PAGE_SIZE, RATING_BUCKETS, URLS, detectUiVariantFromUrl, normalizeProfileUrl, parseApplicationId, ratingFromBucket, type RatingBucket, type UiVariant } from './urls.js';
 import { allOfFirst, attrOf, collectLinks, firstPresent, firstVisible, mainText, parseCount, relativeToIso, textOf } from './dom.js';
 import { jobDir, writeJson } from '../storage/files.js';
-import { errorMessage } from '../errors.js';
+import { BrowserNotConnectedError, CheckpointError, NotLoggedInError, TaskCancelledError, errorMessage } from '../errors.js';
 
 export interface SyncApplicantsOptions {
   /** Stop after this many list pages (legacy) / load rounds (Hiring Pro) in THIS call; the caller requeues with nextOffset. Undefined = until the end. */
@@ -36,6 +36,8 @@ export interface SyncApplicantsResult {
   paginationMode?: ApplicantSyncProgress['paginationMode'];
   uiVariant?: UiVariant;
   stoppedEarly?: boolean;
+  /** The page rendered no rows: the caller should wait a while before the next chunk instead of retrying at once. */
+  blank?: boolean;
 }
 
 // ---------------- pure helpers (unit-tested) ----------------
@@ -208,13 +210,14 @@ export function parseFitScore(qualifications: string | undefined | null): FitSco
 }
 
 /**
- * Queue priority bonus so the applicants who match the job best are fetched first: all must-haves +30, 80% +20,
- * two thirds +10, half +5, then up to +4 for preferred qualifications. Unknown fit gets no bonus.
+ * Queue priority bonus so the applicants who match the job best are fetched first: all must-haves +25, 80% +17,
+ * two thirds +9, half +5, then up to +4 for preferred qualifications. Unknown fit gets no bonus. The bonus stays
+ * below 30 so a boosted application (50 + bonus) never outranks a list sync or a sweep (80).
  */
 export function fitPriorityBonus(fit: FitScore | undefined): number {
   if (!fit) return 0;
   const m = fit.mustHave;
-  const base = m >= 1 ? 30 : m >= 0.8 ? 20 : m >= 0.66 ? 10 : m >= 0.5 ? 5 : 0;
+  const base = m >= 1 ? 25 : m >= 0.8 ? 17 : m >= 0.66 ? 9 : m >= 0.5 ? 5 : 0;
   return base + Math.round(fit.preferred * 4);
 }
 
@@ -745,7 +748,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
       lastRunAt: new Date().toISOString(),
     });
   };
-  const result = (complete: boolean, nextPage: number): SyncApplicantsResult => ({
+  const result = (complete: boolean, nextPage: number, blank = false): SyncApplicantsResult => ({
     jobId,
     applicants: st.collected,
     totalReported,
@@ -755,6 +758,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
     paginationMode: 'buttons',
     uiVariant: 'hiring_pro',
     stoppedEarly: stoppedEarly || undefined,
+    blank: blank || undefined,
   });
 
   // A sweep re-reads a complete list in another order from the top (its own chunks pass startOffset explicitly).
@@ -835,9 +839,11 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
     const repeated = rows.length > 0 && firstId === lastFirstId && newToRun === 0;
     lastFirstId = firstId;
     const remaining = totalReported !== undefined && stored < totalReported * 0.98;
-    if (rows.length === 0 && remaining) {
-      // Still nothing after the retries: leave the list incomplete at this page so the next chunk tries again
-      // (a fresh navigation), instead of declaring a 2,000-applicant list finished after a blank render.
+    // A page without cards while more applicants are expected, or while no total could be read (a blank page usually
+    // has no header either): leave the list incomplete at this page so the next chunk tries again after a real pause,
+    // instead of declaring a 2,000-applicant list finished after one blank render. A job that reports 0 applicants
+    // has a total and ends at once.
+    if (rows.length === 0 && (remaining || totalReported === undefined)) {
       const blankRuns = (progress?.blankRuns ?? 0) + 1;
       stoppedEarly = true;
       if (blankRuns >= 3) {
@@ -847,7 +853,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
       }
       log.warn('hiring pro list page stayed empty; will retry this page in the next run', { jobId, stored, totalReported, page: current, blankRuns });
       persist(current, false, blankRuns);
-      return result(false, current);
+      return result(false, current, true);
     }
     const exhausted = rows.length === 0 || repeated || (totalReported !== undefined && stored >= totalReported);
     const hasNextPage = !!(await firstVisible(page, [SEL[gen].applicants.pageButton(current + 1)], { timeoutMs: 300 })) || !!(await paginationNext(page, gen));
@@ -884,6 +890,7 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
  */
 export function shouldSweepList(progress: ApplicantSyncProgress | undefined, currentTaskIsSweep: boolean): boolean {
   if (!progress?.complete || !progress.totalReported) return false;
+  if (progress.uiVariant !== 'hiring_pro') return false; // the legacy list has no table view; its date order is stable anyway
   if (progress.stored >= progress.totalReported * 0.98) return false;
   if (currentTaskIsSweep) return false; // one sweep per list; whatever is left is not shown by LinkedIn
   return (progress.sweeps ?? 0) < 1;
@@ -898,55 +905,79 @@ export interface ParsedTableRow {
   company?: string;
   location?: string;
   qualificationsText?: string;
-  /** LinkedIn's label in the last column: "Top fit", "Maybe", "Not a fit" */
+  /** LinkedIn's match label in the last column ("Top fit", "Maybe", "Not a fit"): the AI's verdict, not the recruiter's rating */
   ratingLabel?: string;
 }
 
-/** A row of the Hiring Pro table view: "Name / Applied on: 9/19/2026 / Title / Company / Location / 4/6 Must-have 5/5 Preferred / Not a fit". */
+/**
+ * A row of the Hiring Pro table view: "Name / Applied on: 9/19/2026 / Title / Company / Location / 4/6 Must-have
+ * 5/5 Preferred / Not a fit". Names are cleaned like list names (badges, connection degree), and with all three of
+ * Title / Company / Location present the fixed column order is used instead of guessing what looks like a place.
+ */
 export function parseTableRowText(text: string): ParsedTableRow | undefined {
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
+    .filter((l) => l && !CONNECTION_LINE.test(l));
   if (lines.length < 2 || !lines.some((l) => /^applied on:/i.test(l))) return undefined;
-  const fullName = lines[0]!;
+  const first = lines[0]!.replace(/\s*·\s*(1st|2nd|3rd|3rd\+)\s*$/i, '').trim();
+  const fullName = parseNameBadges(first)?.name ?? first;
   const appliedOn = lines.find((l) => /^applied on:/i.test(l));
   const qual = lines.filter((l) => /^\d+\/\d+$/.test(l) || /^(must-have|preferred)$/i.test(l));
   let ratingLabel: string | undefined;
   const last = lines[lines.length - 1]!;
   if (/^(top fit|good fit|strong fit|maybe|not a fit|unrated|not rated)$/i.test(last)) ratingLabel = last;
   const rest = lines.slice(1).filter((l) => l !== appliedOn && !qual.includes(l) && l !== ratingLabel);
+  let title: string | undefined;
+  let company: string | undefined;
   let location: string | undefined;
-  if (rest.length && (LOCATION_LIKE.test(rest[rest.length - 1]!) || /\b(area|united states|united kingdom|remote)\b/i.test(rest[rest.length - 1]!))) location = rest.pop();
-  const title = rest[0];
-  const company = rest[1];
+  if (rest.length === 3) {
+    [title, company, location] = rest;
+  } else {
+    const tail = rest[rest.length - 1];
+    if (tail && (LOCATION_LIKE.test(tail) || /\b(area|united states|united kingdom|remote)\b/i.test(tail))) location = rest.pop();
+    title = rest[0];
+    company = rest[1];
+  }
   return { fullName, appliedOn, title, company, location, qualificationsText: qual.join(' · ') || undefined, ratingLabel };
 }
 
-/** LinkedIn's table label → stored rating; "Top fit" is a match label, not a recruiter rating. */
-export function ratingFromTableLabel(label: string | undefined): ApplicantRating | undefined {
-  if (!label) return undefined;
-  const l = label.toLowerCase();
-  if (l === 'good fit') return 'good_fit';
-  if (l === 'maybe') return 'maybe';
-  if (l === 'not a fit') return 'not_a_fit';
-  return undefined;
-}
-
-/** "Applied on: 9/19/2026" (US order) → ISO date. */
+/**
+ * "Applied on: 9/19/2026" → ISO date. LinkedIn writes the account's locale order; a first number above 12 can only
+ * be a day, so that row is read day-first. Impossible dates return undefined instead of rolling into another month.
+ */
 export function parseAppliedOnDate(text: string | undefined): string | undefined {
   const m = text ? /(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(text) : null;
   if (!m) return undefined;
-  const d = new Date(Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2])));
-  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  const year = Number(m[3]);
+  const [month, day] = a > 12 ? [b, a] : [a, b];
+  if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return undefined;
+  return d.toISOString();
+}
+
+/** Names compare the way a person reads them: Unicode-normalised, case-folded (not ASCII-only), single spaces. */
+export function normalizeName(name: string): string {
+  return name.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+}
+
+/** Errors that must end a sweep at once (LinkedIn wants a human, the session is gone, the task was cancelled). */
+function isFatalScrapeError(e: unknown): boolean {
+  return e instanceof CheckpointError || e instanceof NotLoggedInError || e instanceof BrowserNotConnectedError || e instanceof TaskCancelledError;
 }
 
 /**
- * In the detail drawer, open Share and use "Copy application URL". Three ways to read what LinkedIn produced, in
- * order: a temporary hook on the page's clipboard calls, the responses LinkedIn fetched meanwhile, and finally the
- * system clipboard itself (read with a granted permission; the previous text is put back afterwards).
+ * In the detail drawer, open Share and use "Copy application URL", then read the URL LinkedIn put on the system
+ * clipboard (Chrome grants the page clipboard access for that; the previous clipboard text is put back afterwards).
+ * Hooks on the page's clipboard calls cannot see that copy: patchright evaluates in an isolated world, so LinkedIn's
+ * own navigator.clipboard.writeText is never patched. The responses LinkedIn fetched meanwhile are the fallback, but
+ * only a body naming exactly one application counts, because the table page's own payload lists every row on the
+ * page. Whatever the source, an id from another job or from the clipboard's previous text is refused.
  */
-async function copiedApplicationId(ctx: ScrapeContext): Promise<string | undefined> {
+async function copiedApplicationId(ctx: ScrapeContext, jobId: string): Promise<string | undefined> {
   const { page, human, log } = ctx;
   const mark = ctx.capture.mark();
   let previousClipboard: string | undefined;
@@ -954,38 +985,20 @@ async function copiedApplicationId(ctx: ScrapeContext): Promise<string | undefin
     await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://www.linkedin.com' });
     previousClipboard = await page.evaluate(() => navigator.clipboard.readText()).catch(() => undefined);
   } catch {
-    /* permissions unavailable: hooks and network still work */
+    /* permissions unavailable: the network fallback still works */
   }
-  const armed = await page
-    .evaluate(() => {
-      const w = window as unknown as { __liCopied?: string[]; __liRestore?: () => void };
-      if (w.__liRestore) return true;
-      w.__liCopied = [];
-      const clip = navigator.clipboard;
-      const origWrite = clip?.writeText ? clip.writeText.bind(clip) : undefined;
-      const origExec = document.execCommand.bind(document);
-      if (clip && origWrite) {
-        clip.writeText = (t: string) => {
-          w.__liCopied!.push(String(t));
-          return origWrite(t);
-        };
-      }
-      document.execCommand = (cmd: string, ...rest: unknown[]) => {
-        if (cmd === 'copy') {
-          const active = document.activeElement as HTMLInputElement | null;
-          w.__liCopied!.push(window.getSelection()?.toString() || active?.value || '');
-        }
-        return (origExec as (c: string, ...r: unknown[]) => boolean)(cmd, ...rest);
-      };
-      w.__liRestore = () => {
-        if (clip && origWrite) clip.writeText = origWrite;
-        document.execCommand = origExec;
-        delete w.__liRestore;
-      };
-      return true;
-    })
-    .catch(() => false);
-  const steps: Record<string, unknown> = { armed };
+  const steps: Record<string, unknown> = { previousClipboardRead: previousClipboard !== undefined };
+  const accept = (text: string, via: string): string | undefined => {
+    const id = parseApplicationId(text);
+    if (!id) return undefined;
+    const job = /[?&]jobId=(\d+)/.exec(text)?.[1];
+    if (job && job !== jobId) {
+      steps.otherJob = via;
+      return undefined;
+    }
+    steps.via = via;
+    return id;
+  };
   try {
     const share = await firstVisible(page, ['button:has-text("Share")'], { timeoutMs: 3000 });
     steps.shareFound = !!share;
@@ -996,31 +1009,23 @@ async function copiedApplicationId(ctx: ScrapeContext): Promise<string | undefin
     if (!copy) return undefined;
     await human.click(page, copy, { noScroll: true });
     await human.pauseMs(700, 1400);
-    const copied = await page.evaluate(() => (window as unknown as { __liCopied?: string[] }).__liCopied ?? []).catch(() => [] as string[]);
-    steps.hooked = copied.length;
-    let url = copied.find((t) => /applicationId=\d+/.test(t));
-    if (!url) {
+    let id: string | undefined;
+    const text = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '');
+    steps.clipboardChanged = text !== '' && text !== previousClipboard;
+    if (text && text !== previousClipboard) id = accept(text, 'clipboard');
+    if (!id) {
       for (const e of ctx.capture.since(mark)) {
-        const m = /applicationId=(\d+)/.exec(e.body);
-        if (m) {
-          url = `?applicationId=${m[1]}`;
-          steps.viaNetwork = true;
-          break;
+        const ids = new Set(Array.from(e.body.matchAll(/applicationId=(\d+)/g), (m) => m[1]!));
+        if (ids.size === 1) {
+          id = accept(`?applicationId=${[...ids][0]}`, 'network');
+          if (id) break;
         }
       }
     }
-    if (!url) {
-      const text = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '');
-      if (/applicationId=\d+/.test(text)) {
-        url = text;
-        steps.viaClipboard = true;
-      }
-    }
-    steps.ok = !!url;
-    return url ? parseApplicationId(url) : undefined;
+    steps.ok = !!id;
+    return id;
   } finally {
     log.info('share menu lookup', steps);
-    await page.evaluate(() => (window as unknown as { __liRestore?: () => void }).__liRestore?.()).catch(() => {});
     if (previousClipboard !== undefined) await page.evaluate((t) => navigator.clipboard.writeText(t), previousClipboard).catch(() => {});
     await page.keyboard.press('Escape').catch(() => {});
   }
@@ -1032,24 +1037,28 @@ interface TableRowOnPage extends ParsedTableRow {
 
 const TABLE_ROW_SELECTOR = 'main [role="button"], main [tabindex="0"]';
 
-async function collectTableRows(page: Page): Promise<TableRowOnPage[]> {
+/** Rows on the table page: `candidates` counts every element that reads like a row, `rows` the ones that parsed. */
+async function collectTableRows(page: Page): Promise<{ rows: TableRowOnPage[]; candidates: number }> {
   const texts = await page
     .evaluate((sel) => Array.from(document.querySelectorAll(sel)).map((e) => ((e as HTMLElement).innerText ?? '').trim()), TABLE_ROW_SELECTOR)
     .catch(() => [] as string[]);
-  const out: TableRowOnPage[] = [];
+  const rows: TableRowOnPage[] = [];
+  let candidates = 0;
   texts.forEach((t, index) => {
     if (!/applied on:/i.test(t)) return;
+    candidates++;
     const parsed = parseTableRowText(t);
-    if (parsed) out.push({ ...parsed, index });
+    if (parsed) rows.push({ ...parsed, index });
   });
-  return out;
+  return { rows, candidates };
 }
 
 /**
  * Second pass over a complete list through the table view (30 rows per page, date order, honoured by LinkedIn).
- * Rows carry no ids, so each row is matched to the stored applicants by name; a row nobody matches is opened
- * with a click, which reveals its application id in the URL, and stored as a list row. Chunked like the list
- * crawl (`maxPages` pages per run, resume with `startOffset`).
+ * Rows carry no ids, so each row is matched to the stored applicants by name; a row nobody matches is opened with a
+ * click, the drawer's Share menu reveals its application id, and it is stored as a list row. Chunked like the list
+ * crawl (`maxPages` pages per run, resume with `startOffset`). Blank pages follow the list crawl's policy: retried in
+ * a later run, and the sweep only counts as done after three blank runs.
  */
 async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: SyncApplicantsOptions): Promise<SyncApplicantsResult> {
   const { page, human, db, log } = ctx;
@@ -1057,7 +1066,7 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
   const totalReported = progress?.totalReported;
   let offset = opts.startOffset ?? 0;
   let recovered = 0;
-  const result = (complete: boolean): SyncApplicantsResult => ({
+  const result = (complete: boolean, blank = false): SyncApplicantsResult => ({
     jobId,
     applicants: st.collected,
     totalReported,
@@ -1066,42 +1075,85 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
     complete,
     paginationMode: 'offset',
     uiVariant: 'hiring_pro',
+    blank: blank || undefined,
   });
-  const persist = (done: boolean) => {
+  // A sweep only ever follows a complete Hiring Pro list crawl. Without that progress (applicants_sync with restart
+  // cleared it, or the list is still being crawled) there is nothing to sweep, and writing progress here would mark
+  // an uncrawled list complete.
+  if (!progress?.complete || progress.uiVariant !== 'hiring_pro') {
+    log.warn('table sweep skipped: this job has no complete Hiring Pro list to sweep', { jobId, complete: progress?.complete, uiVariant: progress?.uiVariant });
+    return result(true);
+  }
+  const persist = (done: boolean, blankRuns = 0) => {
     db.setSyncProgress({
-      ...(progress ?? { jobId, nextOffset: 0, pagesVisited: 0, stored: 0, complete: true }),
-      jobId,
+      ...progress,
       stored: db.countApplicants(jobId),
       complete: true,
-      sweeps: (progress?.sweeps ?? 0) + (done ? 1 : 0) || undefined,
+      blankRuns: blankRuns || undefined,
+      sweeps: (progress.sweeps ?? 0) + (done ? 1 : 0) || undefined,
       lastRunAt: new Date().toISOString(),
     });
   };
   const tableUrl = (start: number) => `${URLS.applicantsProTable(jobId, 'DateApplied')}${start > 0 ? `&start=${start}` : ''}`;
+  // Stored names, compared the way a person reads them. Two applicants may share a name, so a row is only opened when
+  // the page shows more rows with that name than the job has stored applicants with it.
+  const storedByName = new Map<string, number>();
+  for (const n of db.applicantNames(jobId)) {
+    const k = normalizeName(n);
+    storedByName.set(k, (storedByName.get(k) ?? 0) + 1);
+  }
 
   for (;;) {
     await human.goto(page, tableUrl(offset));
     await ctx.assertHealthy();
     await human.pause('read');
-    let rows = await collectTableRows(page);
-    if (!rows.length) {
+    let { rows, candidates } = await collectTableRows(page);
+    const expectFullPage = totalReported === undefined || offset + TABLE_PAGE_SIZE <= totalReported;
+    if (candidates < TABLE_PAGE_SIZE && expectFullPage) {
+      // Fewer rows than a full page where the total says there should be one: a slow render, read again.
       await human.pauseMs(4000, 8000);
-      rows = await collectTableRows(page);
+      const again = await collectTableRows(page);
+      if (again.candidates > candidates) ({ rows, candidates } = again);
     }
     st.pagesThisRun++;
+    if (candidates === 0 && (totalReported === undefined || offset < totalReported)) {
+      const blankRuns = (progress.blankRuns ?? 0) + 1;
+      if (blankRuns >= 3) {
+        log.warn('table page stayed empty in three runs; ending the sweep', { jobId, offset, totalReported });
+        persist(true, blankRuns);
+        return result(true);
+      }
+      log.warn('table page rendered no rows; this page is retried in the next run', { jobId, offset, blankRuns });
+      persist(false, blankRuns);
+      return result(false, true);
+    }
     const now = new Date().toISOString();
-    const missing = rows.filter((r) => db.applicantIdsByName(jobId, r.fullName).length === 0);
-    log.info('table sweep page read', { jobId, offset, rows: rows.length, missing: missing.length });
-    let lastId: string | undefined;
-    for (const [i, row] of missing.entries()) {
+    const onPage = new Map<string, number>();
+    for (const r of rows) {
+      const k = normalizeName(r.fullName);
+      onPage.set(k, (onPage.get(k) ?? 0) + 1);
+    }
+    const surplus = new Map<string, number>();
+    for (const [k, n] of onPage) {
+      const gap = n - (storedByName.get(k) ?? 0);
+      if (gap > 0) surplus.set(k, gap);
+    }
+    const missing = rows.filter((r) => surplus.has(normalizeName(r.fullName)));
+    log.info('table sweep page read', { jobId, offset, rows: rows.length, candidates, missing: missing.length });
+    let opened = 0;
+    for (const row of missing) {
+      const key = normalizeName(row.fullName);
+      if ((surplus.get(key) ?? 0) <= 0) continue; // an earlier row of the page already closed this name's gap
       // A row click opens a detail drawer in the same page (the URL does not change). The drawer shows the profile
       // link, and its Share menu offers "Copy application URL", which carries the application id. The table page is
       // reloaded between rows so a stale drawer can never be read for the next applicant.
-      if (i > 0) {
+      if (opened > 0) {
+        await human.pause('betweenApplicants');
         await human.goto(page, tableUrl(offset));
         await ctx.assertHealthy();
         await human.pause('read');
       }
+      opened++;
       const rowLoc = page.locator(TABLE_ROW_SELECTOR).nth(row.index);
       try {
         await human.pause('short');
@@ -1110,44 +1162,49 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
         if (!profileLink) throw new Error('detail drawer did not open');
         await ctx.assertHealthy();
         const profileHref = await attrOf(profileLink, 'href');
-        // The drawer must belong to this row: its header links the same name to the profile.
+        // The drawer must belong to this row: its header links the same name to the profile. No name is a mismatch too.
         const drawerName = ((await textOf(await firstPresent(page, ['a[href*="/in/"]:not([data-view-name]):visible', 'a[href*="/in/"]:visible']))) ?? '').split('\n')[0]!.trim();
-        if (drawerName && drawerName.localeCompare(row.fullName, undefined, { sensitivity: 'base' }) !== 0) {
-          log.warn('table sweep drawer shows another applicant; skipping this row', { jobId, offset, row: row.index });
+        if (!drawerName || normalizeName(drawerName) !== key) {
+          log.warn('table sweep drawer shows another applicant; skipping this row', { jobId, offset, row: row.index, drawerNamed: !!drawerName });
           continue;
         }
-        const applicationId = await copiedApplicationId(ctx);
-        if (applicationId && applicationId === lastId) {
-          log.warn('table sweep got the same application id twice; skipping this row', { jobId, offset, row: row.index });
+        const applicationId = await copiedApplicationId(ctx, jobId);
+        if (!applicationId) {
+          log.warn('table sweep could not learn the application id of a row', { jobId, offset, row: row.index, hasProfile: !!profileHref });
           continue;
         }
-        if (applicationId) {
-          lastId = applicationId;
-          const a: Applicant = {
-            applicationId,
-            jobId,
-            fullName: row.fullName,
-            headline: [row.title, row.company].filter(Boolean).join(' at ') || undefined,
-            location: row.location,
-            appliedAt: parseAppliedOnDate(row.appliedOn),
-            rating: ratingFromTableLabel(row.ratingLabel),
-            profileUrl: normalizeProfileUrl(profileHref),
-            listSyncedAt: now,
-            raw: { source: 'table-sweep', rowText: `${row.fullName}\n${row.appliedOn ?? ''}`, qualifications: row.qualificationsText, fitLabel: row.ratingLabel, tableOffset: offset },
-          };
-          db.upsertApplicantFromList(a);
-          st.collected.push(a);
-          recovered++;
-          log.info('table sweep recovered an applicant the list never showed', { jobId, applicationId, offset });
-        } else {
-          log.warn('table sweep could not learn the application id of a row', { jobId, offset, hasProfile: !!profileHref });
+        if (db.hasApplicant(applicationId)) {
+          // A row is only opened when no stored applicant carries its name, so an id that is already stored belongs to
+          // someone else (or to this applicant under another spelling); storing the row under it would overwrite them.
+          log.warn('table sweep read an application id that is already stored; skipping this row', { jobId, offset, row: row.index });
+          continue;
         }
-        await human.pause('betweenApplicants');
+        const a: Applicant = {
+          applicationId,
+          jobId,
+          fullName: row.fullName,
+          headline: [row.title, row.company].filter(Boolean).join(' at ') || undefined,
+          location: row.location,
+          appliedAt: parseAppliedOnDate(row.appliedOn),
+          profileUrl: normalizeProfileUrl(profileHref),
+          listSyncedAt: now,
+          // rating stays unset: the table's last column is LinkedIn's match label, kept in raw.fitLabel
+          raw: { source: 'table-sweep', rowText: `${row.fullName}\n${row.appliedOn ?? ''}`, qualifications: row.qualificationsText, fitLabel: row.ratingLabel, tableOffset: offset },
+        };
+        db.upsertApplicantFromList(a);
+        st.collected.push(a);
+        recovered++;
+        surplus.set(key, (surplus.get(key) ?? 1) - 1);
+        storedByName.set(key, (storedByName.get(key) ?? 0) + 1);
+        log.info('table sweep recovered an applicant the list never showed', { jobId, applicationId, offset });
       } catch (e) {
-        log.warn('table sweep could not open a row', { jobId, offset, error: errorMessage(e) });
+        if (isFatalScrapeError(e)) throw e;
+        log.warn('table sweep could not open a row', { jobId, offset, row: row.index, error: errorMessage(e) });
       }
     }
-    const done = rows.length < TABLE_PAGE_SIZE || (totalReported !== undefined && offset + TABLE_PAGE_SIZE >= totalReported);
+    // The table ended (a short page) or the reported total is reached. Rows that failed to parse still count as rows,
+    // so one odd row cannot end the sweep with the remaining pages unread.
+    const done = candidates < TABLE_PAGE_SIZE || (totalReported !== undefined && offset + TABLE_PAGE_SIZE >= totalReported);
     offset += TABLE_PAGE_SIZE;
     // Only now is this page finished (all its unknown rows handled): a retry may resume from the next one.
     opts.onPage?.([], st.pagesThisRun - 1, offset);

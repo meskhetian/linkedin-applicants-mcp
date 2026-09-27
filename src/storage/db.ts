@@ -16,7 +16,7 @@ import type {
 
 const SCHEMA_VERSION = 1;
 
-const DEFAULT_PRIORITY: Record<TaskType, number> = {
+export const DEFAULT_PRIORITY: Record<TaskType, number> = {
   sync_jobs: 100,
   sync_applicants: 80,
   fetch_application: 50,
@@ -536,6 +536,21 @@ export class Db {
   }
 
   /** Application ids of applicants of a job whose stored name equals `fullName` (case-insensitive). */
+  /** Names of every stored applicant of a job, for matching done in JS (SQLite's lower() folds ASCII only). */
+  applicantNames(jobId: string): string[] {
+    return (this.prep('SELECT full_name FROM applicants WHERE job_id = ?').all(jobId) as Row[]).map((r) => String(r.full_name));
+  }
+
+  /**
+   * Older table sweeps stored LinkedIn's match label ("Not a fit") as the recruiter's rating. Clear it where no detail
+   * page has been read since; the label itself stays in raw.fitLabel. Returns the number of rows repaired.
+   */
+  clearTableLabelRatings(jobId?: string): number {
+    const sql = "UPDATE applicants SET rating = NULL WHERE rating IS NOT NULL AND detail_fetched_at IS NULL AND json_extract(raw, '$.source') = 'table-sweep'" + (jobId ? ' AND job_id = ?' : '');
+    const r = jobId ? this.prep(sql).run(jobId) : this.prep(sql).run();
+    return Number(r.changes);
+  }
+
   applicantIdsByName(jobId: string, fullName: string): string[] {
     const rows = this.prep('SELECT application_id FROM applicants WHERE job_id = ? AND lower(full_name) = lower(?)').all(jobId, fullName.trim()) as Row[];
     return rows.map((r) => String(r.application_id));
@@ -621,20 +636,25 @@ export class Db {
     this.prep("UPDATE tasks SET status = 'running', attempts = attempts + 1, started_at = ?, updated_at = ? WHERE id = ?").run(ts, ts, id);
   }
 
+  /** A task cancelled while it ran stays cancelled, even when its runner finished normally. */
   markTaskDone(id: number): void {
     const ts = nowIso();
-    this.prep("UPDATE tasks SET status = 'done', finished_at = ?, updated_at = ?, last_error = NULL WHERE id = ?").run(ts, ts, id);
+    this.prep("UPDATE tasks SET status = 'done', finished_at = ?, updated_at = ?, last_error = NULL WHERE id = ? AND status <> 'cancelled'").run(ts, ts, id);
   }
 
-  /** Fails the task; if attempts remain it goes back to pending with a run_after backoff. */
+  /**
+   * Fails the task; if attempts remain it goes back to pending with a run_after backoff. A task cancelled while it
+   * ran stays cancelled: its failure must not put it back in the queue.
+   */
   markTaskFailed(id: number, error: string, opts: { retry: boolean; backoffMs?: number }): 'retrying' | 'failed' {
     const ts = nowIso();
-    const row = this.prep('SELECT attempts, max_attempts FROM tasks WHERE id = ?').get(id) as Row | undefined;
+    const row = this.prep('SELECT attempts, max_attempts, status FROM tasks WHERE id = ?').get(id) as Row | undefined;
     if (!row) return 'failed';
+    if (String(row.status) === 'cancelled') return 'failed';
     const canRetry = opts.retry && Number(row.attempts) < Number(row.max_attempts);
     if (canRetry) {
       const runAfter = new Date(Date.now() + (opts.backoffMs ?? 60_000)).toISOString();
-      this.prep("UPDATE tasks SET status = 'pending', last_error = ?, run_after = ?, updated_at = ?, shuffle = ? WHERE id = ?").run(
+      this.prep("UPDATE tasks SET status = 'pending', last_error = ?, run_after = ?, updated_at = ?, shuffle = ? WHERE id = ? AND status <> 'cancelled'").run(
         error.slice(0, 2000),
         runAfter,
         ts,
@@ -643,7 +663,7 @@ export class Db {
       );
       return 'retrying';
     }
-    this.prep("UPDATE tasks SET status = 'failed', last_error = ?, finished_at = ?, updated_at = ? WHERE id = ?").run(error.slice(0, 2000), ts, ts, id);
+    this.prep("UPDATE tasks SET status = 'failed', last_error = ?, finished_at = ?, updated_at = ? WHERE id = ? AND status <> 'cancelled'").run(error.slice(0, 2000), ts, ts, id);
     return 'failed';
   }
 
@@ -793,7 +813,8 @@ export function dedupeKey(p: TaskPayload): string {
     case 'sync_jobs':
       return 'sync_jobs';
     case 'sync_applicants':
-      return `sync_applicants:${p.jobId}`;
+      // The sweep is queued by the list task while that task is still running, so it needs its own key to coexist.
+      return p.sweep ? `sync_applicants:${p.jobId}:sweep` : `sync_applicants:${p.jobId}`;
     case 'fetch_application':
       return `fetch_application:${p.applicationId}`;
     case 'fetch_profile':

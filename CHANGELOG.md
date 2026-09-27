@@ -36,6 +36,37 @@ changes; they are called out explicitly.
   "LinkedIn markup may have changed" cool-down: the task is requeued and the worker waits a few minutes.
 - List syncs and sweeps remember their offset after every page, so a failure in the middle of a chunk resumes from
   that page instead of the chunk's first page.
+- **The table sweep never ran on its own.** It was queued from inside the list task that was still running, and the
+  two shared a deduplication key, so the queue refused it every time while the log and the dashboard claimed a
+  sweep was pending. Sweeps have their own key now, the queue's answer is checked before anything is announced, and a
+  test runs the production list runner against a stub crawl to prove the sweep lands in the queue.
+- A task cancelled while it ran could come back: a later failure of the same task put it back to pending, and a
+  normal finish marked it done. Both now leave it cancelled, and a cancelled application fetch queues no profile.
+- The sweep stored LinkedIn's table match label ("Not a fit", "Maybe") as the recruiter's rating, so recovered
+  applicants looked rejected although nobody had rated them. The label stays in the raw data only; rows stored that
+  way are repaired at the next start (`npm run reparse` does it by hand).
+- The sweep could store a row under another applicant's id: the network fallback took the first id it saw in any
+  response, which for the table page is the first row of the page, and the clipboard was read even when nothing had
+  been copied. The clipboard is read first and only when its text changed, a response only counts when it names
+  exactly one application, ids of another job are refused, and an id that is already stored is never written again
+  (a row is only opened because no stored applicant carries its name). Two applicants sharing a name are now both
+  found: a row is opened when the page shows more rows with that name than the job has stored, and names compare
+  with Unicode case folding instead of SQLite's ASCII `lower()`.
+- Inside the sweep, a LinkedIn checkpoint, a lost browser or a cancellation was logged as a failed row and the sweep
+  went on; these now end the sweep at once so the queue pauses as it does everywhere else.
+- A blank or half-rendered table page ended the sweep for good ("not shown by LinkedIn after 1 sweep"). Blank pages
+  now follow the list crawl's policy (retried in later runs, given up after three), rows that failed to parse still
+  count as rows, and a short page where a full one is expected is read again first.
+- A blank list page with no readable total (the first run of a job) marked the list complete with 0 applicants; it now
+  takes the same retry path. Blank-page retries wait 20 minutes instead of running back to back.
+- Fit-ordered application fetches (priority 50 plus a bonus of up to 34) outranked list syncs and sweeps (80). The
+  bonus now tops out at 29, so lists always come first.
+- `applicants_sync` with `restart` cancels the job's queued list chunks and sweep first; before, the fresh crawl was
+  deduplicated against them and a leftover sweep marked the cleared list complete. A sweep also refuses to run
+  without a complete Hiring Pro list to sweep, and the sweep logic ignores legacy lists (no table view there).
+- Table rows: names are cleaned like list names (badges, connection degree), a row with title, company and location
+  uses the fixed column order instead of guessing, and "Applied on" dates are read day-first when the first number
+  is above 12, rejecting impossible dates instead of rolling them into another month.
 - Stopping the worker (Ctrl-C, `browser_close`) while a task runs no longer counts as a failed attempt for that task:
   it goes back to the queue untouched. The "Chrome went away unexpectedly" warning no longer fires for the session's
   own shutdown.
@@ -57,7 +88,10 @@ changes; they are called out explicitly.
   page again, leaves the list incomplete at that page so the next run retries it with a fresh navigation, and
   only gives up after three runs end on the same blank page.
 - `queue_cancel` now also cancels a running task: a list sync stops after its current page, and a cancelled
-  task's own requeue no longer brings it back.
+  task's own requeue no longer brings it back. The tool description and the README say so (they still read
+  "pending only").
+- The README documents how the sweep reads application ids (Share menu, "Copy application URL", system clipboard
+  with the previous text restored) and no longer claims the Hiring Pro list is sorted by applied date.
 - Contact details were captured for 3 of 21 applications although the Contact button was present in 20 of them:
   the SDUI button's text content carries hidden helper text, so the exact-text selector missed it. The button is
   now found by its stable data-view-name (with a contains-text fallback that excludes "Contacted"), the popover's

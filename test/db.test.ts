@@ -114,6 +114,49 @@ describe('cancelling a running task', () => {
     db.requeueTask(id);
     expect(db.taskStatus(id)).toBe('cancelled');
   });
+
+  it('keeps a cancelled task cancelled when its runner fails or finishes', () => {
+    const db = new Db(':memory:');
+    const failing = db.enqueueTask({ type: 'fetch_application', jobId: 'j9', applicationId: 'a1', downloadResume: false })!;
+    const finishing = db.enqueueTask({ type: 'fetch_application', jobId: 'j9', applicationId: 'a2', downloadResume: false })!;
+    db.markTaskRunning(failing);
+    db.markTaskRunning(finishing);
+    expect(db.cancelTasks({ jobId: 'j9' })).toBe(2);
+    expect(db.markTaskFailed(failing, 'selector timeout', { retry: true })).toBe('failed');
+    expect(db.taskStatus(failing)).toBe('cancelled');
+    db.markTaskDone(finishing);
+    expect(db.taskStatus(finishing)).toBe('cancelled');
+    expect(db.taskCounts().pending ?? 0).toBe(0);
+  });
+});
+
+describe('sweep tasks', () => {
+  it('can be queued while the list task of the same job is still running', () => {
+    const db = new Db(':memory:');
+    const list = db.enqueueTask({ type: 'sync_applicants', jobId: 'j1', pagesPerRun: 12 })!;
+    db.markTaskRunning(list);
+    const sweep = db.enqueueTask({ type: 'sync_applicants', jobId: 'j1', pagesPerRun: 12, sort: 'DateApplied', sweep: true, startOffset: 0 });
+    expect(sweep).toBeDefined();
+    expect(db.taskStatus(sweep!)).toBe('pending');
+    // a second sweep for the same job is still deduplicated, and so is a second plain list task
+    expect(db.enqueueTask({ type: 'sync_applicants', jobId: 'j1', pagesPerRun: 12, sort: 'DateApplied', sweep: true, startOffset: 30 })).toBeUndefined();
+    expect(db.enqueueTask({ type: 'sync_applicants', jobId: 'j1', pagesPerRun: 12 })).toBeUndefined();
+  });
+});
+
+describe('table sweep repairs', () => {
+  it('lists stored names and clears ratings that were LinkedIn match labels', () => {
+    const db = seed();
+    db.upsertApplicantFromList({ applicationId: 'a3', jobId: 'j1', fullName: 'Dana Whitfield', rating: 'not_a_fit', listSyncedAt: now, raw: { source: 'table-sweep', fitLabel: 'Not a fit' } });
+    db.upsertApplicantFromList({ applicationId: 'a4', jobId: 'j1', fullName: 'Rated Person', rating: 'good_fit', listSyncedAt: now, raw: { source: 'table-sweep', fitLabel: 'Top fit' } });
+    db.updateApplicantDetail('a4', { rating: 'good_fit' });
+    expect(db.applicantNames('j1').sort()).toEqual(['Ada Lovelace', 'Dana Whitfield', 'Grace Hopper', 'Rated Person']);
+    expect(db.clearTableLabelRatings()).toBe(1);
+    expect(db.getApplicant('a3')!.rating).toBeUndefined();
+    expect(db.getApplicant('a4')!.rating).toBe('good_fit');
+    expect(db.getApplicant('a1')!.rating).toBeUndefined();
+    expect(db.clearTableLabelRatings()).toBe(0);
+  });
 });
 
 describe('applicantIdsByName', () => {

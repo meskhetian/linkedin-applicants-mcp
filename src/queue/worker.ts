@@ -18,6 +18,9 @@ import { BrowserNotConnectedError, CheckpointError, DeferredError, NotLoggedInEr
 
 const TASK_TYPES: TaskType[] = ['sync_jobs', 'sync_applicants', 'fetch_application', 'fetch_profile'];
 
+/** A list or table page that rendered nothing is retried after this pause: a LinkedIn hiccup lasts minutes, not seconds. */
+export const BLANK_PAGE_RETRY_MS = 20 * 60_000;
+
 /** Chromium network errors that mean the machine is offline rather than LinkedIn misbehaving. */
 export const OFFLINE_RE = /net::ERR_(INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|NETWORK_CHANGED|ADDRESS_UNREACHABLE|CONNECTION_(RESET|REFUSED|CLOSED|TIMED_OUT|ABORTED)|TIMED_OUT|PROXY_CONNECTION_FAILED)/i;
 
@@ -90,15 +93,22 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
       });
       if (!r.complete && r.nextOffset !== undefined) {
         // Chunk finished: advance the offset and let the scheduler (hours / caps / breaks) run before the next chunk.
+        // A page that rendered nothing waits a real pause first, otherwise three blank runs would pass within a minute.
         deps.db.updateTaskPayload(task.id, { ...p, startOffset: r.nextOffset });
-        deps.db.requeueTask(task.id);
+        if (r.blank) deps.db.requeueTask(task.id, new Date(Date.now() + BLANK_PAGE_RETRY_MS).toISOString(), 'page rendered no rows; retrying later');
+        else deps.db.requeueTask(task.id);
         return 'requeued';
       }
       const progress = deps.db.getSyncProgress(p.jobId);
       if (progress && shouldSweepList(progress, !!p.sweep)) {
-        deps.db.enqueueTask({ type: 'sync_applicants', jobId: p.jobId, pagesPerRun: p.pagesPerRun, includeNotAFit: p.includeNotAFit, sort: 'DateApplied', sweep: true, startOffset: 0 }, { priority: task.priority });
-        deps.db.addEvent('info', 'list-sweep', `List of job ${p.jobId} ended at ${progress.stored} of ${progress.totalReported}; a sweep through the table view in date order is queued to pick up the applicants the list never showed.`, { jobId: p.jobId });
-        deps.log.info('list ended short of the reported total; table sweep queued', { jobId: p.jobId, stored: progress.stored, totalReported: progress.totalReported });
+        // This task is still 'running' here; the sweep has its own dedupe key so the two can coexist.
+        const sweepId = deps.db.enqueueTask({ type: 'sync_applicants', jobId: p.jobId, pagesPerRun: p.pagesPerRun, includeNotAFit: p.includeNotAFit, sort: 'DateApplied', sweep: true, startOffset: 0 }, { priority: task.priority });
+        if (sweepId !== undefined) {
+          deps.db.addEvent('info', 'list-sweep', `List of job ${p.jobId} ended at ${progress.stored} of ${progress.totalReported}; a sweep through the table view in date order is queued to pick up the applicants the list never showed.`, { jobId: p.jobId, taskId: sweepId });
+          deps.log.info('list ended short of the reported total; table sweep queued', { jobId: p.jobId, stored: progress.stored, totalReported: progress.totalReported, taskId: sweepId });
+        } else {
+          deps.log.warn('list ended short of the reported total; a table sweep for this job is already queued', { jobId: p.jobId, stored: progress.stored, totalReported: progress.totalReported });
+        }
       }
       return 'done';
     },
@@ -136,7 +146,9 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
       });
       if (r.resumePath && !resumeText) deps.log.warn('resume saved but no text could be extracted (scanned PDF?)', { applicationId: p.applicationId, path: r.resumePath });
       const profileUrl = r.profileUrl ?? existing?.profileUrl;
-      if (p.thenProfile && profileUrl) {
+      if (p.thenProfile && deps.db.taskStatus(task.id) === 'cancelled') {
+        deps.log.info('application cancelled while it was fetched; its profile visit is not queued', { applicationId: p.applicationId });
+      } else if (p.thenProfile && profileUrl) {
         deps.db.enqueueTask({ type: 'fetch_profile', jobId: p.jobId, applicationId: p.applicationId, profileUrl, depth: p.thenProfile.depth, savePdf: p.thenProfile.savePdf });
       } else if (p.thenProfile) {
         deps.log.warn('no profile URL found for applicant; profile not queued', { applicationId: p.applicationId });

@@ -5,12 +5,14 @@ import type { Db } from './db.js';
  * Bump when a list-card parser fix should be applied to rows that are already stored.
  * `bootstrap` re-parses once per version; `npm run reparse` does it on demand.
  */
-export const LIST_PARSER_VERSION = 2;
+export const LIST_PARSER_VERSION = 3;
 export const PARSER_VERSION_SETTING = 'parser.listVersion';
 
 export interface ReparseResult {
   rows: number;
   changed: number;
+  /** Rows whose rating was LinkedIn's table match label rather than a recruiter rating, now cleared */
+  ratingsCleared: number;
 }
 
 interface StoredRow {
@@ -28,12 +30,15 @@ interface StoredRow {
  * Re-run the current list-card parsers over the raw card text stored with every applicant row and
  * update name, headline, location, applied date and the viewed flag where the new parse differs.
  * Rows whose detail page was already fetched keep the detail parser's values unless the stored
- * name still carries a LinkedIn badge ("Jane Doe, new applicant").
+ * name still carries a LinkedIn badge ("Jane Doe, new applicant"). Rows recovered by a table sweep
+ * lose the rating an older version derived from LinkedIn's match label.
  */
 export function reparseListRows(db: Db, jobId?: string): ReparseResult {
   const rows = db.rawApplicantRows(jobId) as unknown as StoredRow[];
   let changed = 0;
+  let ratingsCleared = 0;
   db.transaction(() => {
+    ratingsCleared = db.clearTableLabelRatings(jobId);
     for (const r of rows) {
       let raw: Record<string, unknown>;
       try {
@@ -41,6 +46,9 @@ export function reparseListRows(db: Db, jobId?: string): ReparseResult {
       } catch {
         continue;
       }
+      // Rows recovered by a table sweep were parsed from the table view, whose text the list parsers do not
+      // understand; re-parsing them would blank the headline. They keep what the sweep stored.
+      if (raw.source === 'table-sweep') continue;
       const rowText = typeof raw.rowText === 'string' ? raw.rowText : undefined;
       const cardText = typeof raw.cardText === 'string' ? raw.cardText : undefined;
       if (!rowText && !cardText) continue;
@@ -91,7 +99,7 @@ export function reparseListRows(db: Db, jobId?: string): ReparseResult {
       changed++;
     }
   });
-  return { rows: rows.length, changed };
+  return { rows: rows.length, changed, ratingsCleared };
 }
 
 /** Run `reparseListRows` once per parser version and remember that it happened. */

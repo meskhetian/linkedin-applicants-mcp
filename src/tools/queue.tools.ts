@@ -82,8 +82,9 @@ export function registerQueueTools(server: McpServer, deps: Deps): void {
   server.registerTool(
     'queue_cancel',
     {
-      title: 'Cancel pending tasks',
-      description: 'Cancel PENDING tasks matching the filters (type / jobId / applicationId). Without filters cancels every pending task. Running tasks finish; done work is untouched.',
+      title: 'Cancel queued tasks',
+      description:
+        'Cancel tasks matching the filters (type / jobId / applicationId); without filters every queued task. Pending tasks leave the queue. A running list sync or sweep stops after its current page; a running application or profile fetch finishes the page it is on, stays cancelled and queues nothing further. Done work is untouched.',
       inputSchema: { type: TASK_TYPE.optional(), jobId: z.string().optional(), applicationId: z.string().optional() },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },

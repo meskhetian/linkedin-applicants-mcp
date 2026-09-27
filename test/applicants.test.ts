@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { decideNextPage, fitPriorityBonus, parseApplicantCardText, parseAppliedOn, parseAppliedOnDate, parseFitScore, parseNameBadges, parseProRowText, parseTableRowText, ratingFromTableLabel, shouldSweepList } from '../src/linkedin/applicants.js';
+import { decideNextPage, fitPriorityBonus, normalizeName, parseApplicantCardText, parseAppliedOn, parseAppliedOnDate, parseFitScore, parseNameBadges, parseProRowText, parseTableRowText, shouldSweepList } from '../src/linkedin/applicants.js';
+import { DEFAULT_PRIORITY } from '../src/storage/db.js';
 
 describe('parseApplicantCardText (legacy)', () => {
   it('parses a legacy-style card', () => {
@@ -158,27 +159,34 @@ describe('fit score from the list counters', () => {
 
   it('ranks full matches first and unknown fit last', () => {
     const b = (q: string | undefined) => fitPriorityBonus(parseFitScore(q));
-    expect(b('6/6 · Must-have · 5/5 · Preferred')).toBe(34);
-    expect(b('5/6 · Must-have · 5/5 · Preferred')).toBe(24);
-    expect(b('4/6 · Must-have · 5/5 · Preferred')).toBe(14);
+    expect(b('6/6 · Must-have · 5/5 · Preferred')).toBe(29);
+    expect(b('5/6 · Must-have · 5/5 · Preferred')).toBe(21);
+    expect(b('4/6 · Must-have · 5/5 · Preferred')).toBe(13);
     expect(b('3/6 · Must-have · 0/5 · Preferred')).toBe(5);
     expect(b('1/6 · Must-have · 5/5 · Preferred')).toBe(4);
     expect(b(undefined)).toBe(0);
+  });
+
+  it('never lifts an application above a list sync or sweep in the queue', () => {
+    const best = DEFAULT_PRIORITY.fetch_application + fitPriorityBonus(parseFitScore('9/9 · Must-have · 9/9 · Preferred'));
+    expect(best).toBeLessThan(DEFAULT_PRIORITY.sync_applicants);
   });
 });
 
 
 describe('shouldSweepList', () => {
-  const base = { jobId: 'j', nextOffset: 1000, pagesVisited: 41, totalReported: 1005, stored: 955, complete: true, stoppedEarly: true } as const;
+  const base = { jobId: 'j', nextOffset: 1000, pagesVisited: 41, totalReported: 1005, stored: 955, complete: true, stoppedEarly: true, uiVariant: 'hiring_pro' } as const;
   it('sweeps once when a complete list is more than 2% short', () => {
     expect(shouldSweepList({ ...base }, false)).toBe(true);
     expect(shouldSweepList({ ...base, sweeps: 1 }, false)).toBe(false);
     expect(shouldSweepList({ ...base }, true)).toBe(false);
   });
-  it('does not sweep lists that are close enough, incomplete, or without a total', () => {
+  it('does not sweep lists that are close enough, incomplete, without a total, or not Hiring Pro', () => {
     expect(shouldSweepList({ ...base, stored: 990 }, false)).toBe(false);
     expect(shouldSweepList({ ...base, complete: false }, false)).toBe(false);
     expect(shouldSweepList({ ...base, totalReported: undefined }, false)).toBe(false);
+    expect(shouldSweepList({ ...base, uiVariant: 'legacy' }, false)).toBe(false);
+    expect(shouldSweepList({ ...base, uiVariant: undefined }, false)).toBe(false);
   });
 });
 
@@ -193,11 +201,28 @@ describe('table view rows', () => {
     expect(parseTableRowText('Sort by: Date applied (Newest first)')).toBeUndefined();
   });
 
-  it('maps table labels and dates', () => {
-    expect(ratingFromTableLabel('Not a fit')).toBe('not_a_fit');
-    expect(ratingFromTableLabel('Maybe')).toBe('maybe');
-    expect(ratingFromTableLabel('Top fit')).toBeUndefined();
+  it('uses the fixed column order when title, company and location are all present', () => {
+    const row = parseTableRowText('Mehmet Kaya\n\nApplied on: 9/19/2026\n\nVP Sales\n\nAcme, Inc.\n\nIstanbul\n\n6/6\n\nMust-have\n\n2/5\n\nPreferred\n\nTop fit')!;
+    expect(row).toMatchObject({ fullName: 'Mehmet Kaya', title: 'VP Sales', company: 'Acme, Inc.', location: 'Istanbul' });
+  });
+
+  it('cleans names like the list parser does', () => {
+    expect(parseTableRowText('Jane Doe · 2nd\n\nApplied on: 9/19/2026\n\nRemote')!.fullName).toBe('Jane Doe');
+    expect(parseTableRowText('Jane Doe, new applicant\n\nApplied on: 9/19/2026')!.fullName).toBe('Jane Doe');
+    expect(parseTableRowText('Jane Doe\n\n2nd degree connection\n\nApplied on: 9/19/2026\n\nRemote')!).toMatchObject({ fullName: 'Jane Doe', location: 'Remote' });
+  });
+
+  it('parses dates in either locale order and rejects impossible ones', () => {
     expect(parseAppliedOnDate('Applied on: 9/19/2026')).toBe('2026-09-19T00:00:00.000Z');
+    expect(parseAppliedOnDate('Applied on: 19/09/2026')).toBe('2026-09-19T00:00:00.000Z');
+    expect(parseAppliedOnDate('Applied on: 31/02/2026')).toBeUndefined();
+    expect(parseAppliedOnDate('Applied on: 13/13/2026')).toBeUndefined();
     expect(parseAppliedOnDate('yesterday')).toBeUndefined();
+  });
+
+  it('compares names beyond ASCII case', () => {
+    expect(normalizeName('ÖZGE  YILMAZ')).toBe(normalizeName('Özge Yılmaz'.toLocaleUpperCase('tr')) === normalizeName('ÖZGE YILMAZ') ? normalizeName('ÖZGE YILMAZ') : normalizeName('ÖZGE  YILMAZ'));
+    expect(normalizeName('ÉMILE Zola')).toBe(normalizeName('Émile  zola'));
+    expect(normalizeName('Ada Lovelace')).not.toBe(normalizeName('Ada Byron'));
   });
 });

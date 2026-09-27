@@ -48,7 +48,12 @@ export function registerApplicantsTools(server: McpServer, deps: Deps): void {
           // Unknown job: register a placeholder so applicants can reference it (title filled by the next jobs_sync)
           deps.db.upsertJob({ jobId: id, title: `Job ${id}`, status: 'unknown', url: `https://www.linkedin.com/hiring/jobs/${id}/applicants/`, syncedAt: new Date().toISOString() });
         }
-        if (restart) deps.db.clearSyncProgress(id);
+        if (restart) {
+          // Old chunks or a pending sweep of this job must not survive the restart: the fresh crawl would be
+          // deduplicated against them, and a sweep would mark the cleared list complete without crawling anything.
+          deps.db.cancelTasks({ type: 'sync_applicants', jobId: id });
+          deps.db.clearSyncProgress(id);
+        }
       }
       const result = enqueueAll(
         deps,
