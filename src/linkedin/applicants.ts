@@ -22,6 +22,10 @@ export interface SyncApplicantsOptions {
   sweep?: boolean;
   /** Called after each page is parsed and persisted. */
   onPage?: (applicants: Applicant[], pageIndex: number, nextOffset: number) => void;
+  /** Sweep: called before a table row is opened (an application view). May throw to stop or defer the run. */
+  beforeRowOpen?: () => Promise<void> | void;
+  /** Sweep: called right after a table row was clicked, so the caller can count the application view. */
+  afterRowOpen?: () => void;
 }
 
 export interface SyncApplicantsResult {
@@ -891,6 +895,9 @@ async function crawlHiringPro(ctx: ScrapeContext, st: CrawlState, opts: SyncAppl
 export function shouldSweepList(progress: ApplicantSyncProgress | undefined, currentTaskIsSweep: boolean): boolean {
   if (!progress?.complete || !progress.totalReported) return false;
   if (progress.uiVariant !== 'hiring_pro') return false; // the legacy list has no table view; its date order is stable anyway
+  // Far below the total means a broken crawl (blank pages, markup change), not display ties: re-run applicants_sync
+  // instead of opening hundreds of drawers.
+  if (progress.stored < progress.totalReported * 0.8) return false;
   if (progress.stored >= progress.totalReported * 0.98) return false;
   if (currentTaskIsSweep) return false; // one sweep per list; whatever is left is not shown by LinkedIn
   return (progress.sweeps ?? 0) < 1;
@@ -971,11 +978,11 @@ function isFatalScrapeError(e: unknown): boolean {
 
 /**
  * In the detail drawer, open Share and use "Copy application URL", then read the URL LinkedIn put on the system
- * clipboard (Chrome grants the page clipboard access for that; the previous clipboard text is put back afterwards).
- * Hooks on the page's clipboard calls cannot see that copy: patchright evaluates in an isolated world, so LinkedIn's
- * own navigator.clipboard.writeText is never patched. The responses LinkedIn fetched meanwhile are the fallback, but
- * only a body naming exactly one application counts, because the table page's own payload lists every row on the
- * page. Whatever the source, an id from another job or from the clipboard's previous text is refused.
+ * clipboard (Chrome grants the page clipboard access for that moment; the grant is cleared again and the previous
+ * clipboard text is put back afterwards). Hooks on the page's clipboard calls cannot see that copy: patchright
+ * evaluates in an isolated world, so LinkedIn's own navigator.clipboard.writeText is never patched. The responses
+ * LinkedIn fetched meanwhile are the fallback, but only a body naming exactly one application counts. Whatever the
+ * source, an id from another job or from the clipboard's previous text is refused.
  */
 async function copiedApplicationId(ctx: ScrapeContext, jobId: string): Promise<string | undefined> {
   const { page, human, log } = ctx;
@@ -1000,13 +1007,15 @@ async function copiedApplicationId(ctx: ScrapeContext, jobId: string): Promise<s
     return id;
   };
   try {
-    const share = await firstVisible(page, ['button:has-text("Share")'], { timeoutMs: 3000 });
+    // The drawer's own Share button, not a page-level "Share job": prefer the dialog scope and the exact label.
+    const share = await firstVisible(page, ['[role="dialog"] button:has-text("Share")', 'button:text-is("Share")', 'button:has-text("Share")'], { timeoutMs: 3000 });
     steps.shareFound = !!share;
     if (!share) return undefined;
     await human.click(page, share, { noScroll: true });
     const copy = await firstVisible(page, [':text-is("Copy application URL")', ':text-matches("^Copy application URL", "i")', '[role="menuitem"]:has-text("Copy application URL")'], { timeoutMs: 4000 });
     steps.copyFound = !!copy;
     if (!copy) return undefined;
+    await human.pauseMs(400, 1200); // a person reads the menu before picking an item
     await human.click(page, copy, { noScroll: true });
     await human.pauseMs(700, 1400);
     let id: string | undefined;
@@ -1026,7 +1035,9 @@ async function copiedApplicationId(ctx: ScrapeContext, jobId: string): Promise<s
     return id;
   } finally {
     log.info('share menu lookup', steps);
-    if (previousClipboard !== undefined) await page.evaluate((t) => navigator.clipboard.writeText(t), previousClipboard).catch(() => {});
+    // Put back only text that was there (an empty read means an image, a file or nothing: writing '' would wipe it).
+    if (previousClipboard) await page.evaluate((t) => navigator.clipboard.writeText(t), previousClipboard).catch(() => {});
+    await page.context().clearPermissions().catch(() => {});
     await page.keyboard.press('Escape').catch(() => {});
   }
 }
@@ -1036,16 +1047,28 @@ interface TableRowOnPage extends ParsedTableRow {
 }
 
 const TABLE_ROW_SELECTOR = 'main [role="button"], main [tabindex="0"]';
+const DRAWER_PROFILE_LINK = 'a[data-view-name="hiring-applicant-view-profile"]';
 
-/** Rows on the table page: `candidates` counts every element that reads like a row, `rows` the ones that parsed. */
+/**
+ * Rows on the table page: `candidates` counts every element that reads like a row, `rows` the ones that parsed.
+ * An element that contains another row-like element is a container, not a row, and is left out.
+ */
 async function collectTableRows(page: Page): Promise<{ rows: TableRowOnPage[]; candidates: number }> {
   const texts = await page
-    .evaluate((sel) => Array.from(document.querySelectorAll(sel)).map((e) => ((e as HTMLElement).innerText ?? '').trim()), TABLE_ROW_SELECTOR)
+    .evaluate((sel) => {
+      const rowLike = /applied on:/i;
+      return Array.from(document.querySelectorAll(sel)).map((e) => {
+        const text = ((e as HTMLElement).innerText ?? '').trim();
+        if (!rowLike.test(text)) return '';
+        const inner = Array.from(e.querySelectorAll(sel)).some((c) => rowLike.test((c as HTMLElement).innerText ?? ''));
+        return inner ? '' : text;
+      });
+    }, TABLE_ROW_SELECTOR)
     .catch(() => [] as string[]);
   const rows: TableRowOnPage[] = [];
   let candidates = 0;
   texts.forEach((t, index) => {
-    if (!/applied on:/i.test(t)) return;
+    if (!t) return;
     candidates++;
     const parsed = parseTableRowText(t);
     if (parsed) rows.push({ ...parsed, index });
@@ -1054,11 +1077,40 @@ async function collectTableRows(page: Page): Promise<{ rows: TableRowOnPage[]; c
 }
 
 /**
+ * Find a row again after the page changed (drawer closed, page reloaded): by content, never by its old position,
+ * because any focusable element rendered before it shifts the index. Among rows with the same name and date the one
+ * nearest to the old position wins, and the element's own text is checked right before it is clicked.
+ */
+async function locateTableRow(page: Page, row: TableRowOnPage): Promise<Locator | undefined> {
+  const key = normalizeName(row.fullName);
+  const { rows } = await collectTableRows(page);
+  const same = rows.filter((r) => normalizeName(r.fullName) === key && r.appliedOn === row.appliedOn);
+  if (!same.length) return undefined;
+  const best = same.reduce((a, b) => (Math.abs(b.index - row.index) < Math.abs(a.index - row.index) ? b : a));
+  const loc = page.locator(TABLE_ROW_SELECTOR).nth(best.index);
+  const parsed = parseTableRowText((await loc.innerText().catch(() => '')) ?? '');
+  return parsed && normalizeName(parsed.fullName) === key ? loc : undefined;
+}
+
+/** Close the open drawer the way a person does (Escape, then its dismiss button) and wait until it is gone. */
+async function closeDrawer(ctx: ScrapeContext): Promise<boolean> {
+  const { page, human } = ctx;
+  const link = page.locator(DRAWER_PROFILE_LINK).first();
+  await page.keyboard.press('Escape').catch(() => {});
+  await human.pause('short');
+  if (await link.waitFor({ state: 'hidden', timeout: 5000 }).then(() => true, () => false)) return true;
+  const dismiss = await firstVisible(page, ['[role="dialog"] button[aria-label*="Dismiss" i]', '[role="dialog"] button[aria-label*="Close" i]', 'button[aria-label*="Dismiss" i]'], { timeoutMs: 1000 });
+  if (dismiss) await human.click(page, dismiss, { noScroll: true });
+  return link.waitFor({ state: 'hidden', timeout: 5000 }).then(() => true, () => false);
+}
+
+/**
  * Second pass over a complete list through the table view (30 rows per page, date order, honoured by LinkedIn).
  * Rows carry no ids, so each row is matched to the stored applicants by name; a row nobody matches is opened with a
- * click, the drawer's Share menu reveals its application id, and it is stored as a list row. Chunked like the list
- * crawl (`maxPages` pages per run, resume with `startOffset`). Blank pages follow the list crawl's policy: retried in
- * a later run, and the sweep only counts as done after three blank runs.
+ * click, the drawer's Share menu reveals its application id, and it is stored as a list row. Every opened row is an
+ * application view and goes through `beforeRowOpen` / `afterRowOpen` (caps, hours, breaks, cancellation). Chunked
+ * like the list crawl (`maxPages` pages per run, resume with `startOffset`). Blank pages follow the list crawl's
+ * policy: retried in a later run, and the sweep only counts as done after three blank runs.
  */
 async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: SyncApplicantsOptions): Promise<SyncApplicantsResult> {
   const { page, human, db, log } = ctx;
@@ -1094,7 +1146,25 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
       lastRunAt: new Date().toISOString(),
     });
   };
+  // A run that opened rows but learned no id (Share menu or clipboard changed) is retried later like a blank page,
+  // and given up after three such runs, instead of cycling through every row with no yield.
+  const retryLater = (why: string) => {
+    const blankRuns = (progress.blankRuns ?? 0) + 1;
+    if (blankRuns >= 3) {
+      log.warn(`${why} in three runs; ending the sweep`, { jobId, offset, totalReported });
+      persist(true, blankRuns);
+      return result(true);
+    }
+    log.warn(`${why}; this page is retried in the next run`, { jobId, offset, blankRuns });
+    persist(false, blankRuns);
+    return result(false, true);
+  };
   const tableUrl = (start: number) => `${URLS.applicantsProTable(jobId, 'DateApplied')}${start > 0 ? `&start=${start}` : ''}`;
+  const openTable = async () => {
+    await human.goto(page, tableUrl(offset));
+    await ctx.assertHealthy();
+    await human.pause('read');
+  };
   // Stored names, compared the way a person reads them. Two applicants may share a name, so a row is only opened when
   // the page shows more rows with that name than the job has stored applicants with it.
   const storedByName = new Map<string, number>();
@@ -1104,9 +1174,7 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
   }
 
   for (;;) {
-    await human.goto(page, tableUrl(offset));
-    await ctx.assertHealthy();
-    await human.pause('read');
+    await openTable();
     let { rows, candidates } = await collectTableRows(page);
     const expectFullPage = totalReported === undefined || offset + TABLE_PAGE_SIZE <= totalReported;
     if (candidates < TABLE_PAGE_SIZE && expectFullPage) {
@@ -1116,17 +1184,7 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
       if (again.candidates > candidates) ({ rows, candidates } = again);
     }
     st.pagesThisRun++;
-    if (candidates === 0 && (totalReported === undefined || offset < totalReported)) {
-      const blankRuns = (progress.blankRuns ?? 0) + 1;
-      if (blankRuns >= 3) {
-        log.warn('table page stayed empty in three runs; ending the sweep', { jobId, offset, totalReported });
-        persist(true, blankRuns);
-        return result(true);
-      }
-      log.warn('table page rendered no rows; this page is retried in the next run', { jobId, offset, blankRuns });
-      persist(false, blankRuns);
-      return result(false, true);
-    }
+    if (candidates === 0 && (totalReported === undefined || offset < totalReported)) return retryLater('table page rendered no rows');
     const now = new Date().toISOString();
     const onPage = new Map<string, number>();
     for (const r of rows) {
@@ -1141,66 +1199,85 @@ async function sweepHiringProTable(ctx: ScrapeContext, st: CrawlState, opts: Syn
     const missing = rows.filter((r) => surplus.has(normalizeName(r.fullName)));
     log.info('table sweep page read', { jobId, offset, rows: rows.length, candidates, missing: missing.length });
     let opened = 0;
+    let noIdStreak = 0;
     for (const row of missing) {
       const key = normalizeName(row.fullName);
       if ((surplus.get(key) ?? 0) <= 0) continue; // an earlier row of the page already closed this name's gap
-      // A row click opens a detail drawer in the same page (the URL does not change). The drawer shows the profile
-      // link, and its Share menu offers "Copy application URL", which carries the application id. The table page is
-      // reloaded between rows so a stale drawer can never be read for the next applicant.
+      // Caps, working hours, breaks and queue_cancel apply per opened row (each one is an application view).
+      await opts.beforeRowOpen?.();
       if (opened > 0) {
+        // Like a person: close the drawer and move to the next row. Reload only when it will not go away.
         await human.pause('betweenApplicants');
-        await human.goto(page, tableUrl(offset));
-        await ctx.assertHealthy();
-        await human.pause('read');
+        if (!(await closeDrawer(ctx))) await openTable();
       }
-      opened++;
-      const rowLoc = page.locator(TABLE_ROW_SELECTOR).nth(row.index);
-      try {
-        await human.pause('short');
-        await human.click(page, rowLoc);
-        const profileLink = await firstVisible(page, ['a[data-view-name="hiring-applicant-view-profile"]', 'a:has-text("View full profile")'], { timeoutMs: 15_000 });
-        if (!profileLink) throw new Error('detail drawer did not open');
-        await ctx.assertHealthy();
-        const profileHref = await attrOf(profileLink, 'href');
-        // The drawer must belong to this row: its header links the same name to the profile. No name is a mismatch too.
-        const drawerName = ((await textOf(await firstPresent(page, ['a[href*="/in/"]:not([data-view-name]):visible', 'a[href*="/in/"]:visible']))) ?? '').split('\n')[0]!.trim();
-        if (!drawerName || normalizeName(drawerName) !== key) {
-          log.warn('table sweep drawer shows another applicant; skipping this row', { jobId, offset, row: row.index, drawerNamed: !!drawerName });
-          continue;
+      // A row click opens a detail drawer in the same page (the URL does not change). The drawer shows the profile
+      // link, and its Share menu offers "Copy application URL", which carries the application id. When the drawer
+      // shows someone else (a stale drawer), the page is reloaded once and the row tried again.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          await closeDrawer(ctx);
+          await openTable();
         }
-        const applicationId = await copiedApplicationId(ctx, jobId);
-        if (!applicationId) {
-          log.warn('table sweep could not learn the application id of a row', { jobId, offset, row: row.index, hasProfile: !!profileHref });
-          continue;
+        const rowLoc = await locateTableRow(page, row);
+        if (!rowLoc) {
+          log.warn('table sweep could not find the row again on the page; skipping it', { jobId, offset, row: row.index, attempt });
+          break;
         }
-        if (db.hasApplicant(applicationId)) {
-          // A row is only opened when no stored applicant carries its name, so an id that is already stored belongs to
-          // someone else (or to this applicant under another spelling); storing the row under it would overwrite them.
-          log.warn('table sweep read an application id that is already stored; skipping this row', { jobId, offset, row: row.index });
-          continue;
+        try {
+          await human.pause('short');
+          await human.click(page, rowLoc);
+          opened++;
+          opts.afterRowOpen?.();
+          const profileLink = await firstVisible(page, [DRAWER_PROFILE_LINK, 'a:has-text("View full profile")'], { timeoutMs: 15_000 });
+          if (!profileLink) throw new Error('detail drawer did not open');
+          await ctx.assertHealthy();
+          await human.pause('short'); // read the header before touching anything in the drawer
+          const profileHref = await attrOf(profileLink, 'href');
+          // The drawer must belong to this row: its header links the same name to the profile. No name is a mismatch too.
+          const drawerName = ((await textOf(await firstPresent(page, ['a[href*="/in/"]:not([data-view-name]):visible', 'a[href*="/in/"]:visible']))) ?? '').split('\n')[0]!.trim();
+          if (!drawerName || normalizeName(drawerName) !== key) {
+            log.warn('table sweep drawer shows another applicant', { jobId, offset, row: row.index, attempt, drawerNamed: !!drawerName });
+            continue;
+          }
+          const applicationId = await copiedApplicationId(ctx, jobId);
+          if (!applicationId) {
+            noIdStreak++;
+            log.warn('table sweep could not learn the application id of a row', { jobId, offset, row: row.index, hasProfile: !!profileHref });
+            break;
+          }
+          if (db.hasApplicant(applicationId)) {
+            // A row is only opened when no stored applicant carries its name, so an id that is already stored belongs to
+            // someone else (or to this applicant under another spelling); storing the row under it would overwrite them.
+            log.warn('table sweep read an application id that is already stored; skipping this row', { jobId, offset, row: row.index });
+            break;
+          }
+          const a: Applicant = {
+            applicationId,
+            jobId,
+            fullName: row.fullName,
+            headline: [row.title, row.company].filter(Boolean).join(' at ') || undefined,
+            location: row.location,
+            appliedAt: parseAppliedOnDate(row.appliedOn),
+            profileUrl: normalizeProfileUrl(profileHref),
+            listSyncedAt: now,
+            // rating stays unset: the table's last column is LinkedIn's match label, kept in raw.fitLabel
+            raw: { source: 'table-sweep', rowText: `${row.fullName}\n${row.appliedOn ?? ''}`, qualifications: row.qualificationsText, fitLabel: row.ratingLabel, tableOffset: offset },
+          };
+          db.upsertApplicantFromList(a);
+          st.collected.push(a);
+          recovered++;
+          noIdStreak = 0;
+          surplus.set(key, (surplus.get(key) ?? 1) - 1);
+          storedByName.set(key, (storedByName.get(key) ?? 0) + 1);
+          log.info('table sweep recovered an applicant the list never showed', { jobId, applicationId, offset });
+          break;
+        } catch (e) {
+          if (isFatalScrapeError(e)) throw e;
+          log.warn('table sweep could not open a row', { jobId, offset, row: row.index, error: errorMessage(e) });
+          break;
         }
-        const a: Applicant = {
-          applicationId,
-          jobId,
-          fullName: row.fullName,
-          headline: [row.title, row.company].filter(Boolean).join(' at ') || undefined,
-          location: row.location,
-          appliedAt: parseAppliedOnDate(row.appliedOn),
-          profileUrl: normalizeProfileUrl(profileHref),
-          listSyncedAt: now,
-          // rating stays unset: the table's last column is LinkedIn's match label, kept in raw.fitLabel
-          raw: { source: 'table-sweep', rowText: `${row.fullName}\n${row.appliedOn ?? ''}`, qualifications: row.qualificationsText, fitLabel: row.ratingLabel, tableOffset: offset },
-        };
-        db.upsertApplicantFromList(a);
-        st.collected.push(a);
-        recovered++;
-        surplus.set(key, (surplus.get(key) ?? 1) - 1);
-        storedByName.set(key, (storedByName.get(key) ?? 0) + 1);
-        log.info('table sweep recovered an applicant the list never showed', { jobId, applicationId, offset });
-      } catch (e) {
-        if (isFatalScrapeError(e)) throw e;
-        log.warn('table sweep could not open a row', { jobId, offset, row: row.index, error: errorMessage(e) });
       }
+      if (noIdStreak >= 3) return retryLater('table sweep learned no application id from three rows in a row');
     }
     // The table ended (a short page) or the reported total is reached. Rows that failed to parse still count as rows,
     // so one odd row cannot end the sweep with the remaining pages unread.

@@ -188,6 +188,10 @@ describe('shouldSweepList', () => {
     expect(shouldSweepList({ ...base, uiVariant: 'legacy' }, false)).toBe(false);
     expect(shouldSweepList({ ...base, uiVariant: undefined }, false)).toBe(false);
   });
+  it('does not sweep a list that is far below the total (a broken crawl, not display ties)', () => {
+    expect(shouldSweepList({ ...base, stored: 803 }, false)).toBe(false);
+    expect(shouldSweepList({ ...base, stored: 804 }, false)).toBe(true);
+  });
 });
 
 describe('table view rows', () => {

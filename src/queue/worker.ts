@@ -90,6 +90,17 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
           deps.db.updateTaskPayload(task.id, { ...p, startOffset: nextOffset });
           if (deps.db.taskStatus(task.id) === 'cancelled') throw new TaskCancelledError(task.id);
         },
+        // Every drawer a sweep opens is an application view: it obeys the same daily cap, hourly cap, working hours
+        // and breaks as fetch_application, and queue_cancel takes effect between rows, not only between pages.
+        beforeRowOpen: () => {
+          if (deps.db.taskStatus(task.id) === 'cancelled') throw new TaskCancelledError(task.id);
+          const d = deps.scheduler.check('fetch_application');
+          if (!d.ok) throw new DeferredError(d.resumeAt, `sweep paused: ${d.reason}`);
+        },
+        afterRowOpen: () => {
+          const { breakMs } = deps.scheduler.recordAction('fetch_application');
+          if (breakMs) deps.scheduler.takeBreak(breakMs);
+        },
       });
       if (!r.complete && r.nextOffset !== undefined) {
         // Chunk finished: advance the offset and let the scheduler (hours / caps / breaks) run before the next chunk.

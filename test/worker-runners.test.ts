@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { DeferredError, TaskCancelledError } from '../src/errors.js';
+import type { SyncApplicantsOptions } from '../src/linkedin/applicants.js';
 import { defaultPacing, loadConfig } from '../src/config.js';
 import type { ScrapeContext } from '../src/linkedin/context.js';
 import { syncApplicantList } from '../src/linkedin/applicants.js';
@@ -56,6 +58,29 @@ describe('sync_applicants runner', () => {
     db.enqueueTask({ type: 'sync_applicants', jobId: 'j1', pagesPerRun: 12, sort: 'DateApplied', sweep: true, startOffset: 0 });
     expect(await new Worker(deps).runOnce()).toBe(true);
     expect(db.taskCounts().pending ?? 0).toBe(0);
+  });
+
+  it('makes every opened sweep row obey the application cap and queue_cancel', async () => {
+    const { deps, db } = makeDeps();
+    let hooks: SyncApplicantsOptions | undefined;
+    vi.mocked(syncApplicantList).mockImplementationOnce(async (ctx, _jobId, opts) => {
+      hooks = opts;
+      ctx.db.setSyncProgress({ ...progress, sweeps: 1 });
+      return { jobId: 'j1', applicants: [], totalReported: 1005, pagesVisited: 1, complete: true, uiVariant: 'hiring_pro' };
+    });
+    const id = db.enqueueTask({ type: 'sync_applicants', jobId: 'j1', pagesPerRun: 12, sort: 'DateApplied', sweep: true, startOffset: 0 })!;
+    expect(await new Worker(deps).runOnce()).toBe(true);
+    expect(hooks?.beforeRowOpen).toBeTypeOf('function');
+    const beforeRow = async () => hooks!.beforeRowOpen!();
+    // fresh day, cap not reached: rows may be opened, and each open counts as an application
+    await expect(beforeRow()).resolves.toBeUndefined();
+    deps.getPacing().dailyApplicantCap = 1;
+    hooks!.afterRowOpen!();
+    await expect(beforeRow()).rejects.toBeInstanceOf(DeferredError);
+    // queue_cancel between two rows stops the sweep at once
+    deps.getPacing().dailyApplicantCap = 100;
+    db.db.prepare("UPDATE tasks SET status = 'cancelled' WHERE id = ?").run(id); // as queue_cancel does to a running task
+    await expect(beforeRow()).rejects.toBeInstanceOf(TaskCancelledError);
   });
 
   it('waits a while before retrying a page that rendered nothing', async () => {

@@ -54,6 +54,20 @@ changes; they are called out explicitly.
   with Unicode case folding instead of SQLite's ASCII `lower()`.
 - Inside the sweep, a LinkedIn checkpoint, a lost browser or a cancellation was logged as a failed row and the sweep
   went on; these now end the sweep at once so the queue pauses as it does everywhere else.
+- **The sweep opened drawers outside the pacing rules.** Every unmatched table row is an application view, yet a
+  whole chunk (up to 12 pages) was one scheduler action: the daily applicant cap, the hourly cap, working hours,
+  breaks and `queue_cancel` were not consulted between rows. Each row now goes through the same checks as an
+  application fetch and is counted as one; a chunk that hits a cap or the end of the day is deferred and resumes on
+  the same page (recovered rows are not opened again). Lists stored below 80 percent of LinkedIn's count are not
+  swept at all, since that gap is a broken crawl rather than display ties.
+- The sweep reloaded the table page before every row and clicked the row by its old position in the page, which any
+  focusable element rendered before it could shift (the click could land on another control). It now closes the
+  drawer like a person does and clicks the next row, finds the row again by its content and checks the element's
+  text right before clicking, reloads only when the drawer will not close or shows someone else, and pauses after the
+  drawer opens and after the Share menu appears. The Share button is looked up inside the drawer first, so a
+  page-level "Share job" cannot be picked. The clipboard permission is cleared after each read, and the previous
+  clipboard content is only written back when it was text (an empty read used to wipe a copied image or file).
+  A run that learns no id from three rows stops and retries later instead of cycling through the page.
 - A blank or half-rendered table page ended the sweep for good ("not shown by LinkedIn after 1 sweep"). Blank pages
   now follow the list crawl's policy (retried in later runs, given up after three), rows that failed to parse still
   count as rows, and a short page where a full one is expected is read again first.
