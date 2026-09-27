@@ -15,7 +15,7 @@ Export the applicants of your LinkedIn job posts (lists, application details, re
 
 - LinkedIn's job-poster dashboard has **no bulk export**: applications and resumes can only be opened one at a time.
 - Popular postings collect **thousands of applicants** across open and closed jobs; downloading each resume by hand does not scale.
-- Any burst of automation gets a LinkedIn **account restricted**. This server does the slow, careful thing instead: one visible tab, human-like input, working hours, daily caps that ramp up, random breaks, shuffled order, and a resumable queue that keeps going for as many days as a job needs.
+- Any burst of automation gets a LinkedIn **account restricted**. This server does the slow, careful thing instead: one visible tab, human-like input, working hours, daily and hourly caps that ramp up and vary from day to day like a person's workload (67 applications one day, 43 the next, never the same number twice), random breaks, shuffled order, and a resumable queue that keeps going for as many days as a job needs.
 - It is strictly **read-only** on LinkedIn: it never rates, shortlists, messages or connects with anyone.
 
 > Automating LinkedIn is against its User Agreement. Read [Compliance and privacy](#compliance-and-privacy) before using this.
