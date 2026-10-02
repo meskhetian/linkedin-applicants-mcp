@@ -95,3 +95,19 @@ describe('sync_applicants runner', () => {
     expect(JSON.parse(t.payload).startOffset).toBe(500);
   });
 });
+
+describe('fetch_application runner', () => {
+  it("queues the profile at the application's priority, not behind every other application", async () => {
+    const appMod = await import('../src/linkedin/application.js');
+    const spy = vi.spyOn(appMod, 'fetchApplicationDetail').mockResolvedValue({ fullName: 'Dana Whitfield', profileUrl: 'https://www.linkedin.com/in/dana/', extra: {} } as never);
+    const { deps, db } = makeDeps();
+    db.upsertJob({ jobId: 'j1', title: 'Chief of Staff', status: 'open', url: 'https://www.linkedin.com/hiring/jobs/j1/applicants/', syncedAt: new Date().toISOString() });
+    db.upsertApplicantFromList({ applicationId: 'a1', jobId: 'j1', fullName: 'Dana Whitfield', listSyncedAt: new Date().toISOString() });
+    db.enqueueTask({ type: 'fetch_application', jobId: 'j1', applicationId: 'a1', downloadResume: false, thenProfile: { depth: 'basic', savePdf: false } }, { priority: 71 });
+    db.enqueueTask({ type: 'fetch_application', jobId: 'j1', applicationId: 'a2', downloadResume: false }, { priority: 58 });
+    expect(await new Worker(deps).runOnce()).toBe(true);
+    const profile = db.db.prepare("SELECT priority FROM tasks WHERE type = 'fetch_profile'").get() as { priority: number } | undefined;
+    expect(profile?.priority).toBe(71);
+    spy.mockRestore();
+  });
+});

@@ -10,6 +10,11 @@ changes; they are called out explicitly.
 
 ### Fixed
 
+- **Profiles of strong candidates were never fetched.** A profile visit queued after an application (the
+  `includeProfile` chain) got the default profile priority, 40, below every remaining application (50 to 79 with fit
+  ordering). Profiles therefore only ran on days the application cap was used up, and with hundreds of applications
+  queued that did not happen for days. The chained profile now keeps its application's priority, so a top candidate's
+  profile follows soon after their application.
 - **Chrome no longer crashes when a resume is opened.** Google Chrome 154 crashed its browser process
   ("Google Chrome quit unexpectedly") the moment an automation-triggered download started. Resume files are now
   captured passively: Chrome makes every request itself, the worker reads the resume viewer's responses to learn

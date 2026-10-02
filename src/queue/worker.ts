@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { Config } from '../config.js';
-import type { Db } from '../storage/db.js';
+import { DEFAULT_PRIORITY, type Db } from '../storage/db.js';
 import type { BrowserSession } from '../browser/session.js';
 import type { ScheduleDecision, Scheduler } from './scheduler.js';
 import type { Logger, PacingSettings, Task, TaskPayload, TaskType, WorkerStatus } from '../types.js';
@@ -160,7 +160,13 @@ export function defaultRunners(): Record<TaskType, TaskRunner> {
       if (p.thenProfile && deps.db.taskStatus(task.id) === 'cancelled') {
         deps.log.info('application cancelled while it was fetched; its profile visit is not queued', { applicationId: p.applicationId });
       } else if (p.thenProfile && profileUrl) {
-        deps.db.enqueueTask({ type: 'fetch_profile', jobId: p.jobId, applicationId: p.applicationId, profileUrl, depth: p.thenProfile.depth, savePdf: p.thenProfile.savePdf });
+        // The profile keeps its application's place in the queue (fit-ordered applications sit at 50 to 79). At the
+        // default profile priority (40) it would wait behind every remaining application and only run on days the
+        // application cap is used up, so strong candidates' profiles could wait for weeks.
+        deps.db.enqueueTask(
+          { type: 'fetch_profile', jobId: p.jobId, applicationId: p.applicationId, profileUrl, depth: p.thenProfile.depth, savePdf: p.thenProfile.savePdf },
+          { priority: Math.max(task.priority, DEFAULT_PRIORITY.fetch_profile) },
+        );
       } else if (p.thenProfile) {
         deps.log.warn('no profile URL found for applicant; profile not queued', { applicationId: p.applicationId });
       }
