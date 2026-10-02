@@ -258,3 +258,29 @@ describe('Worker loop', () => {
     return w.stop();
   });
 });
+
+describe('current task note', () => {
+  it('is cleared when a new worker takes over and as soon as a task finishes', async () => {
+    let seenDuring: unknown;
+    const { deps, db } = makeDeps({
+      fetch_profile: async (_task, _ctx, d) => {
+        seenDuring = d.db.getSetting(SETTINGS.currentTask);
+        return 'done';
+      },
+    });
+    // left behind by a worker that was killed during its pause between tasks
+    db.setSetting(SETTINGS.currentTask, { id: 999, type: 'fetch_application', startedAt: '2026-10-01T20:23:30.656Z' });
+    const w = new Worker(deps);
+    w.start();
+    expect(db.getSetting(SETTINGS.currentTask)).toBeUndefined();
+    await w.stop();
+    db.enqueueTask({ type: 'fetch_profile', jobId: 'j', applicationId: 'a', profileUrl: 'u', depth: 'basic', savePdf: false });
+    let afterRun: unknown = 'not checked';
+    deps.sleep = async () => {
+      afterRun = db.getSetting(SETTINGS.currentTask); // the pause between tasks runs after the task finished
+    };
+    expect(await new Worker(deps).runOnce()).toBe(true);
+    expect(seenDuring).toMatchObject({ type: 'fetch_profile' });
+    expect(afterRun).toBeUndefined();
+  });
+});

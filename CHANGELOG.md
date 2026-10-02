@@ -10,6 +10,10 @@ changes; they are called out explicitly.
 
 ### Fixed
 
+- The dashboard said "working: fetch_application" while the worker was idle. The note naming the current task was
+  only cleared after the pause that follows a task, so a worker killed during that pause (Claude Desktop quitting
+  with the worker in one of its terminal tabs) left it behind, and the next worker never cleared it. The note is now
+  cleared as soon as a task's work ends and whenever a worker takes over the queue.
 - **Profiles of strong candidates were never fetched.** A profile visit queued after an application (the
   `includeProfile` chain) got the default profile priority, 40, below every remaining application (50 to 79 with fit
   ordering). Profiles therefore only ran on days the application cap was used up, and with hundreds of applications

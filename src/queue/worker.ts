@@ -239,6 +239,9 @@ export class Worker {
     this.startedAt = new Date().toISOString();
     this.abort = new AbortController();
     this.touchLock();
+    // A previous owner killed mid-task (app quit, Ctrl-C in a closed tab) leaves its current-task note behind; this
+    // process owns the queue now and has no task yet, so the dashboard must not keep showing "working".
+    this.deps.db.deleteSetting(SETTINGS.currentTask);
     this.heartbeat = setInterval(() => this.touchLock(), 30_000);
     this.heartbeat.unref?.();
     this.loop = this.run()
@@ -403,6 +406,9 @@ export class Worker {
       this.lastError = undefined;
       db.addEvent('info', 'task', `${task.type} ${result}`, { id: task.id, jobId: task.jobId, applicationId: task.applicationId });
       tlog.info('task finished', { result });
+      // The task's LinkedIn work is over: the pause and break below are not "working" on it.
+      this.current = undefined;
+      db.deleteSetting(SETTINGS.currentTask);
       if (breakMs) {
         db.addEvent('info', 'break', `taking a ${Math.round(breakMs / 60_000)} min break`, { ms: breakMs });
         tlog.info('taking a break', { minutes: Math.round(breakMs / 60_000) });
