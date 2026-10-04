@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { bezierPath, randInt, sampleLogNormal } from '../src/browser/humanize.js';
+import { defaultPacing } from '../src/config.js';
+import { Humanizer, SLOW_MOVE_MS, bezierPath, randInt, sampleLogNormal } from '../src/browser/humanize.js';
 
 function seeded(seed: number) {
   let s = seed >>> 0;
@@ -56,5 +57,42 @@ describe('randInt', () => {
     const seen = new Set<number>();
     for (let i = 0; i < 2000; i++) seen.add(randInt(3, 5, rng));
     expect([...seen].sort()).toEqual([3, 4, 5]);
+  });
+});
+
+describe('Humanizer.moveTo with a starved window', () => {
+  const pacing = () => defaultPacing('normal');
+  function fakePage(moveMs: number) {
+    const moves: Array<{ x: number; y: number }> = [];
+    const page = {
+      viewportSize: () => ({ width: 1440, height: 900 }),
+      mouse: {
+        move: async (x: number, y: number) => {
+          moves.push({ x, y });
+          if (moveMs) await new Promise((r) => setTimeout(r, moveMs));
+        },
+      },
+    };
+    return { page: page as never, moves };
+  }
+
+  it('keeps the full curved path when Chrome answers quickly', async () => {
+    const h = new Humanizer(pacing, () => 0.5);
+    const { page, moves } = fakePage(0);
+    await h.moveTo(page, 100, 100); // first move sets the cursor near the centre
+    moves.length = 0;
+    await h.moveTo(page, 1300, 800);
+    expect(moves.length).toBeGreaterThan(20);
+    expect(moves.at(-1)).toEqual({ x: 1300, y: 800 });
+  });
+
+  it('finishes in a few larger steps once a single move is slow', async () => {
+    const h = new Humanizer(pacing, () => 0.5);
+    const { page, moves } = fakePage(SLOW_MOVE_MS + 30);
+    await h.moveTo(page, 100, 100);
+    moves.length = 0;
+    await h.moveTo(page, 1300, 800);
+    expect(moves.length).toBeLessThanOrEqual(3);
+    expect(moves.at(-1)).toEqual({ x: 1300, y: 800 });
   });
 });

@@ -99,6 +99,9 @@ export interface ScrollPageOptions {
  * Human-like input on top of Playwright: log-normal pauses, Bezier mouse paths,
  * chunked wheel scrolling, variable-speed typing, idle fidgeting.
  */
+/** A single mouse move slower than this means Chrome's window is starved of frames (covered by other windows). */
+export const SLOW_MOVE_MS = 250;
+
 export class Humanizer {
   private cursors = new WeakMap<Page, Point>();
 
@@ -155,17 +158,34 @@ export class Humanizer {
     const target = overshoot
       ? { x: to.x + randFloat(-18, 18, this.rng), y: to.y + randFloat(-14, 14, this.rng) }
       : to;
-    for (const p of bezierPath(from, target, steps, this.rng)) {
+    // Chrome answers each mouse event only after its window has drawn a frame. A window fully covered by other apps
+    // gets few frames from macOS, and every move then takes about a second: a 40-point path cost 40 seconds per
+    // click. As soon as a move is that slow, finish the path in two larger steps; a visible window keeps the full path.
+    const t0 = Date.now();
+    let slowest = 0;
+    let moves = 0;
+    const path = bezierPath(from, target, steps, this.rng);
+    for (let i = 0; i < path.length; i++) {
+      const p = path[i]!;
+      const m0 = Date.now();
       await page.mouse.move(p.x, p.y);
+      moves++;
+      const took = Date.now() - m0;
+      slowest = Math.max(slowest, took);
+      if (took > SLOW_MOVE_MS && i < path.length - 3) i = path.length - 3;
       await sleep(randInt(4, 16, this.rng));
     }
     if (overshoot) {
       await sleep(randInt(40, 120, this.rng));
-      for (const p of bezierPath(target, to, randInt(4, 8, this.rng), this.rng)) {
+      const back = slowest > SLOW_MOVE_MS ? [to] : bezierPath(target, to, randInt(4, 8, this.rng), this.rng);
+      for (const p of back) {
         await page.mouse.move(p.x, p.y);
+        moves++;
         await sleep(randInt(6, 18, this.rng));
       }
     }
+    const moveMs = Date.now() - t0;
+    if (moveMs > 2000) this.log?.debug('slow mouse path', { ms: moveMs, planned: steps, moves, slowestMoveMs: slowest });
     this.cursors.set(page, to);
   }
 
@@ -187,7 +207,10 @@ export class Humanizer {
 
   /** Scroll into view (if needed), move there on a curve, press, hold, release. */
   async click(page: Page, locator: Locator, opts: { button?: 'left' | 'right' | 'middle'; noScroll?: boolean } = {}): Promise<void> {
+    const t0 = Date.now();
     if (!opts.noScroll) await this.scrollToLocator(page, locator);
+    const scrollMs = Date.now() - t0;
+    if (scrollMs > 3000) this.log?.debug('slow scroll before click', { ms: scrollMs });
     let p = await this.targetPoint(locator);
     const vp = await this.viewport(page);
     if (p && (p.x < 0 || p.y < 0 || p.x > vp.w || p.y > vp.h)) {
@@ -198,7 +221,9 @@ export class Humanizer {
     }
     if (!p || p.x < 0 || p.y < 0 || p.x > vp.w || p.y > vp.h) {
       // Fallback: element not visible/in layout, let Playwright do it, still with a delay.
+      const t1 = Date.now();
       await locator.click({ delay: randInt(40, 130, this.rng), button: opts.button });
+      this.log?.debug('click fell back to the locator', { ms: Date.now() - t1, point: p ?? null });
       return;
     }
     await this.moveTo(page, p.x, p.y);

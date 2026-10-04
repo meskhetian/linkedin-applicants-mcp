@@ -10,6 +10,14 @@ changes; they are called out explicitly.
 
 ### Fixed
 
+- **Applications took 2 to 3 minutes each while Chrome sat behind other windows.** Chrome acknowledges each mouse
+  event only after its window draws a frame, and macOS gives a window that other apps fully cover only a few frames.
+  Every simulated mouse move then took about a second, so a 40-point mouse path cost 40 seconds, twice per
+  application (Contact, then Resume). The path now switches to two larger steps as soon as a single move is slow; a
+  visible window keeps the full curve. Measured on live applications: 33 to 42 seconds each instead of 120 to 200.
+  The detail pane is also located with one pass inside the page and addressed by a plain CSS path instead of
+  `:has()` text queries that every later lookup re-ran, and the application fetch logs step timings at debug level
+  (`LINKEDIN_MCP_LOG_LEVEL=debug`) so a slow step can be traced.
 - **A worker that ran for days got slower every hour.** The passive network capture lives as long as the browser
   session and kept up to 400 responses of up to 4 MB each (LinkedIn's hiring pages are about 4 MB), plus a parsed
   copy of every JSON body. After three days the worker held 4.5 GB and an application fetch took about 3 minutes

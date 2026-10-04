@@ -145,17 +145,42 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     variant = 'hiring_pro';
   }
   await human.pause('read');
+  // Step timings at debug level: an application fetch that slows down can be traced to the step responsible.
+  let stepAt = Date.now();
+  const step = (name: string) => {
+    const now = Date.now();
+    log.debug('application step', { step: name, ms: now - stepAt });
+    stepAt = now;
+  };
+  if (ctx.cfg.logLevel === 'debug') {
+    const frame = await page
+      .evaluate(
+        () =>
+          // No named inner functions: the dev runner would wrap them in a helper the page does not have.
+          new Promise<{ visibility: string; focus: boolean; frameMs: number }>((resolve) => {
+            const t = performance.now();
+            requestAnimationFrame(() => resolve({ visibility: document.visibilityState, focus: document.hasFocus(), frameMs: Math.round(performance.now() - t) }));
+            setTimeout(() => resolve({ visibility: document.visibilityState, focus: document.hasFocus(), frameMs: -1 }), 3000);
+          }),
+      )
+      .catch(() => undefined);
+    log.debug('page rendering state', { ...frame });
+  }
   await human.scrollBy(page, 220);
   await human.pauseMs(400, 1200);
+  step('scroll');
 
   const gen = await ctx.generation();
+  step('generation');
   // Hiring Pro renders list + detail side by side: isolate the detail pane (the innermost block holding the
   // "View full profile" link and the Resume control) so header parsing does not pick up the first list row.
   const panel = variant === 'hiring_pro' ? await locateProDetailPane(page) : await firstVisible(page, SEL[gen].detail.panel, { timeoutMs: 5000 });
+  step('pane');
   const root: Locator | Page = panel ?? page;
   const text = panel ? ((await textOf(panel)) ?? (await mainText(page))) : await mainText(page);
   const links = await collectLinks(page);
   const header = parseDetailHeaderText(text);
+  step('text');
 
   const fullName = cleanName((await textOf(await firstVisible(root, SEL[gen].detail.name, { timeoutMs: 1500 }))) ?? header.fullName);
   const headline = (await textOf(await firstVisible(root, SEL[gen].detail.headline, { timeoutMs: 400 }))) ?? header.headline;
@@ -163,8 +188,10 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
   const appliedAgo = header.appliedAgo ?? (await textOf(await firstVisible(root, SEL[gen].detail.appliedAgo, { timeoutMs: 400 })));
   const profileHref = (await attrOf(await firstPresent(root, SEL[gen].detail.profileLink), 'href')) ?? links.find((l) => /linkedin\.com\/in\//i.test(l.href))?.href;
   const profileUrl = normalizeProfileUrl(profileHref);
+  step('header fields');
   const profileUrn = findProfileUrn(ctx, mark);
   const rating = await detectRatingOnPage(page, gen);
+  step('rating');
 
   // Contact info shared with the application: mailto:/tel: links, a "Contact" button (Hiring Pro) or the legacy "More" menu.
   // Only the header part of the pane is scanned for free text: the experience section below holds year ranges.
@@ -179,10 +206,13 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
       (await firstVisible(root, ['button:text-matches("^\\s*Contact( info)?\\s*$", "i")'], { timeoutMs: 400 })) ??
       (await firstVisible(root, SEL[gen].detail.moreButton, { timeoutMs: 1000 }));
     contactDiag.found = !!more;
+    step('contact find');
     if (more) {
       try {
         const bodyBefore = await page.evaluate(() => document.body.innerText).catch(() => '');
+        step('contact body before');
         await human.click(page, more);
+        step('contact click');
         contactDiag.clicked = true;
         await human.pause('short');
         for (const it of await allOfFirst(page, SEL[gen].detail.contactItems)) contactText += `${(await textOf(it)) ?? ''}\n`;
@@ -212,6 +242,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
           })
           .catch(() => ({ text: '', links: [] as string[] }));
         contactText += popover.text;
+        step('contact popover read');
         email ??= extractEmail(contactText) ?? popover.links.find((h) => h.startsWith('mailto:'))?.slice(7);
         phone ??= extractPhone(contactText) ?? popover.links.find((h) => h.startsWith('tel:'))?.slice(4);
       } catch (e) {
@@ -223,6 +254,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     }
   }
 
+  step('contact');
   // Qualifications (Hiring Pro): must-have / preferred statements and the applicant's match
   const qualificationsText = extractQualificationsText(text);
   const fitLabel = extractFitLabel(qualificationsText);
@@ -231,6 +263,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
   const screeningSection = await firstVisible(root, SEL[gen].detail.screeningSection, { timeoutMs: 800 });
   const screeningText = (await textOf(screeningSection)) ?? sliceAfter(text, /screening question/i);
   const screeningAnswers = parseScreeningText(screeningText ?? '');
+  step('screening');
 
   // Resume
   let resume: ResumeOutcome = { strategy: 'none', hasResume: false };
@@ -240,6 +273,7 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
     resume.hasResume = !!(await firstPresent(root, [...SEL[gen].detail.resumeButton, ...SEL[gen].detail.resumeAttachment, ...SEL[gen].detail.downloadResumeLink]));
   }
 
+  step('resume');
   await ctx.capture.drain();
   writeJson(path.join(opts.saveDir, 'raw-application.json'), {
     url: page.url(),
@@ -286,7 +320,70 @@ export async function fetchApplicationDetail(ctx: ScrapeContext, jobId: string, 
  * Resume control) down to the "View full profile" link at the bottom, so it includes the Contact button, the
  * Qualifications section and the experience summary. Header-only blocks are used only as a last resort.
  */
+/**
+ * Find the Hiring Pro detail pane in ONE pass inside the page and return a plain CSS path to it (tag:nth-child steps
+ * from body). Start at the pane's "View full profile" link and climb to the innermost div that holds the header and
+ * summary: an /in/ link, a line starting with "Applied" and at least 400 characters. Never climb into the container
+ * that also holds the applicant list (its cards are a[componentkey^="paginatedApplicantCard-"]); the last good div
+ * below it wins then. Self-contained (no helpers, no closures) because it is serialised into the page by evaluate().
+ */
+export function findDetailPanePath(doc?: Document): string | null {
+  const d = doc ?? document;
+  const anchors = Array.from(d.querySelectorAll('a'));
+  let link: Element | null = null;
+  for (const a of anchors) {
+    if (a.getAttribute('data-view-name') === 'hiring-applicant-view-profile' || /view full profile/i.test(a.textContent ?? '')) link = a;
+  }
+  if (!link) return null;
+  let best: Element | null = null;
+  let pane: Element | null = null;
+  let el: Element | null = link.parentElement;
+  while (el && el.tagName !== 'BODY' && el.tagName !== 'HTML') {
+    if (el.querySelector('a[componentkey^="paginatedApplicantCard-"]')) break;
+    if (el.tagName === 'DIV') {
+      const text = (el as HTMLElement).innerText ?? el.textContent ?? '';
+      if (/(^|\n)\s*Applied/i.test(text) && el.querySelector('a[href*="/in/"]')) {
+        best ??= el;
+        if (text.length >= 400) {
+          pane = el;
+          break;
+        }
+      }
+    }
+    el = el.parentElement;
+  }
+  const target = pane ?? best;
+  if (!target) return null;
+  const steps: string[] = [];
+  let cur: Element | null = target;
+  while (cur && cur.tagName !== 'BODY' && cur.tagName !== 'HTML') {
+    const parent: Element | null = cur.parentElement;
+    if (!parent) return null;
+    steps.unshift(`${cur.tagName.toLowerCase()}:nth-child(${Array.prototype.indexOf.call(parent.children, cur) + 1})`);
+    cur = parent;
+  }
+  return steps.length ? `body > ${steps.join(' > ')}` : null;
+}
+
+/**
+ * The detail pane as a cheap locator. The pane used to be found with `div:has(...)` text queries over the whole page,
+ * and every later lookup inside it re-ran them: on LinkedIn's large applicant page that cost about 100 seconds per
+ * application. Now one in-page pass yields a plain CSS path; the old queries remain the fallback.
+ */
 async function locateProDetailPane(page: Page): Promise<Locator | null> {
+  try {
+    const cssPath = await page.evaluate(findDetailPanePath as () => string | null);
+    if (cssPath) {
+      const loc = page.locator(cssPath);
+      if ((await loc.count()) === 1) return loc;
+    }
+  } catch {
+    /* fall back to the text queries below */
+  }
+  return locateProDetailPaneByText(page);
+}
+
+async function locateProDetailPaneByText(page: Page): Promise<Locator | null> {
   const selectors = [
     'div:has(a[href*="/in/"]):has(a:has-text("View full profile")):has(:text-matches("^Applied", "i"))',
     'div:has(a[href*="/in/"]):has(a:has-text("View full profile")):has(:text-is("Resume"))',
@@ -681,6 +778,12 @@ function assertPageAlive(page: Page): void {
 async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator | Page, links: Array<{ href: string; text: string }>, saveDir: string): Promise<ResumeOutcome> {
   const { page, human, log } = ctx;
   const mark = ctx.capture.mark();
+  let rAt = Date.now();
+  const rstep = (name: string) => {
+    const now = Date.now();
+    log.debug('resume step', { step: name, ms: now - rAt });
+    rAt = now;
+  };
   const closeViewer = async () => {
     const d = await firstVisible(page, SEL[gen].detail.dismiss, { timeoutMs: 800 });
     if (d) await human.click(page, d, { noScroll: true }).catch(() => {});
@@ -741,7 +844,9 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
     }
 
     // (c) Resume control → viewer payload / popup with the signed URL / direct file
+    rstep('attachment and download links');
     const btn = (await firstVisible(root, SEL[gen].detail.resumeButton, { timeoutMs: 1500 })) ?? (await firstVisible(page, SEL[gen].detail.resumeButton, { timeoutMs: 500 }));
+    rstep('resume button found');
     if (!btn) {
       const t = await mainText(page, 20_000);
       return { strategy: 'none', hasResume: /\bresume\b|\bcv\b/i.test(t) && !/no resume/i.test(t) };
@@ -758,6 +863,7 @@ async function downloadResume(ctx: ScrapeContext, gen: Generation, root: Locator
       return { strategy: 'none', hasResume: true };
     }
     const direct = await clickAndTrap(ctx, btn, trap, saveDir, 8000);
+    rstep('click and trap');
     if (direct) {
       // A recruiter closes the viewer they opened; the dismiss control is only pressed when it is there.
       if (await firstVisible(page, SEL[gen].detail.dismiss, { timeoutMs: 400 })) await closeViewer();
