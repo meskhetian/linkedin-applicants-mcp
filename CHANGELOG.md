@@ -10,6 +10,11 @@ changes; they are called out explicitly.
 
 ### Fixed
 
+- **A worker that ran for days got slower every hour.** The passive network capture lives as long as the browser
+  session and kept up to 400 responses of up to 4 MB each (LinkedIn's hiring pages are about 4 MB), plus a parsed
+  copy of every JSON body. After three days the worker held 4.5 GB and an application fetch took about 3 minutes
+  instead of 1 at the same pace, as garbage collection struggled. The capture now has a total budget (96 MB by
+  default, `maxTotalBytes`) and drops the oldest bodies first.
 - The dashboard said "working: fetch_application" while the worker was idle. The note naming the current task was
   only cleared after the pause that follows a task, so a worker killed during that pause (Claude Desktop quitting
   with the worker in one of its terminal tabs) left it behind, and the next worker never cleared it. The note is now

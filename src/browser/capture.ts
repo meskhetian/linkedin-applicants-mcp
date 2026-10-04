@@ -29,6 +29,12 @@ const KEEP_REQ_HEADERS = ['x-li-track', 'x-li-page-instance', 'x-li-lang', 'x-re
 export interface CaptureOptions {
   maxEntries?: number;
   maxBodyBytes?: number;
+  /**
+   * Budget for all kept bodies together (approximate bytes; a parsed JSON copy counts as much again). The capture lives
+   * as long as the browser session, often days: without a budget 400 entries of up to 4 MB each kept gigabytes in the
+   * worker and every task slowed down as garbage collection struggled. Oldest entries go first.
+   */
+  maxTotalBytes?: number;
   /** Persist every captured body to <rawDir>/<date>/<seq>-<kind>.json|txt */
   rawDir?: string;
   /** Extra URL substrings to capture */
@@ -45,6 +51,8 @@ export class NetworkCapture {
   private entries: CapturedResponse[] = [];
   private pending = new Set<Promise<void>>();
   private seq = 0;
+  private totalBytes = 0;
+  private readonly maxTotalBytes: number;
   private handlers = new WeakMap<Page, (r: Response) => void>();
   private lastVoyagerHeaders: Record<string, string> = {};
   private readonly maxEntries: number;
@@ -57,6 +65,7 @@ export class NetworkCapture {
   ) {
     this.maxEntries = opts.maxEntries ?? 400;
     this.maxBodyBytes = opts.maxBodyBytes ?? 4 * 1024 * 1024;
+    this.maxTotalBytes = opts.maxTotalBytes ?? 96 * 1024 * 1024;
     this.hints = [...CAPTURE_URL_HINTS, ...(opts.extraHints ?? [])];
   }
 
@@ -127,8 +136,7 @@ export class NetworkCapture {
             /* leave undefined */
           }
         }
-        this.entries.push(entry);
-        if (this.entries.length > this.maxEntries) this.entries.splice(0, this.entries.length - this.maxEntries);
+        this.push(entry);
         if (this.opts.rawDir) this.persist(entry);
       })
       .catch(() => {})
@@ -147,6 +155,31 @@ export class NetworkCapture {
     } catch (err) {
       this.log.debug('capture persist failed', { error: String(err) });
     }
+  }
+
+  private static cost(e: CapturedResponse): number {
+    return e.body.length * (e.json === undefined ? 1 : 2);
+  }
+
+  /** Keep an entry, then drop the oldest ones until both the entry limit and the byte budget hold (the newest stays). */
+  private push(entry: CapturedResponse): void {
+    this.entries.push(entry);
+    this.totalBytes += NetworkCapture.cost(entry);
+    let drop = 0;
+    let bytes = this.totalBytes;
+    while (this.entries.length - drop > 1 && (this.entries.length - drop > this.maxEntries || bytes > this.maxTotalBytes)) {
+      bytes -= NetworkCapture.cost(this.entries[drop]!);
+      drop++;
+    }
+    if (drop) {
+      this.entries.splice(0, drop);
+      this.totalBytes = bytes;
+    }
+  }
+
+  /** How much the capture holds right now (for logs and tests). */
+  stats(): { entries: number; bytes: number } {
+    return { entries: this.entries.length, bytes: this.totalBytes };
   }
 
   /** Wait (bounded) for in-flight bodies to finish. Call after navigation settles, before parsing. */
@@ -200,6 +233,7 @@ export class NetworkCapture {
 
   clear(): void {
     this.entries = [];
+    this.totalBytes = 0;
   }
 
   /** Write all current entries to a directory (for debug_snapshot). Returns the directory. */
